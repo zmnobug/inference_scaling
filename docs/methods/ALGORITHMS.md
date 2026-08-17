@@ -881,7 +881,7 @@ python -m experiments.arllm.run_vllm_backend_benchmark \
 ```
 
 成对测速固定数据、模型、算法、dtype、worker、GPU 数和代码版本，分别记录逐提示与并发墙钟、forward
-slots、token 一致率和数值结果一致率。vLLM `0.25.x` 的 Linux/WSL2 安装命令见仓库
+slots、token 一致率和数值结果一致率。vLLM `0.25.x`--`0.26.x` 的 Linux/WSL2 安装命令见仓库
 [README](../../README.md#安装)。
 
 ### 17.8 公平比较与复现
