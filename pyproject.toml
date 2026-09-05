@@ -47,6 +47,15 @@ training = [
 dllm-training = [
   "peft==0.20.0",
 ]
+swebench = [
+  "datasets==5.0.1",
+  "docker==7.2.0",
+  "litellm==1.99.0",
+  "mini-swe-agent @ git+https://github.com/SWE-agent/mini-swe-agent.git@25941c89cfbc91eb40b3f8756348c91d9977d57e",
+  "openai==2.54.0",
+  "socksio==1.0.0",
+  "swebench==5.0.1",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

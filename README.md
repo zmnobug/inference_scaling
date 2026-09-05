@@ -144,6 +144,7 @@ Qwen2.5-1.5B-Instruct 默认对完整生成计算该分数。具有显式推理�
 | --- | --- |
 | [算法基础、原理与实现](docs/methods/ALGORITHMS.md) | 默认 Qwen MH/IS 完整流程、数学目标、模型职责、参数、关键代码、直观收敛说明、执行优化和 vLLM 配置 |
 | [运行与评测](docs/experiments/GSM8K_EXPERIMENT_DESIGN.md) | 数据配置、方法标识、训练与推理命令、统计量和输出目录 |
+| [SWE-bench Qwen3.8-27B API IS/MH 消融设计](docs/experiments/SWEBENCH_QWEN38_27B_IS_MH_ABLATION_DESIGN.md) | 原版 MiniAgent 接入边界、logprob 目标、IS/MH 参数、分阶段消融和审计要求 |
 | [算法设计与准确率](docs/reports/GSM8K_3090_ALIGNED_RESULTS.md) | 固定实验设置下的准确率、pass@k、奖励与 proposal 对照，以及结果适用范围 |
 | [推理成本与执行效率](docs/reports/RTX3090_ROLLOUT_INFRA.md) | 批处理、IS/MH 复用和奖励调度的墙钟、分模型 FLOPs、建库与设计成本 |
 | [非默认方案记录](docs/methods/ALGORITHMS.md#alg-nondefault-notes) | 已筛选方案的主要成本问题与适用条件 |

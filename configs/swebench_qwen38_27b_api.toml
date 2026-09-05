@@ -1,0 +1,94 @@
+# Qwen3.8-27B OpenAI-compatible API + official mini-SWE-agent v2 experiment.
+# Secrets and the private endpoint stay in environment variables; see the env example.
+
+[run]
+tag = "qwen38-27b-is-mh-v1"
+output_root = "results/swebench"
+subset = "verified"
+split = "test"
+# Exact Hugging Face dataset revision used to materialize dataset.parquet.
+dataset_revision = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
+workers = 1
+seeds = [20260901]
+miniagent_commit = "25941c89cfbc91eb40b3f8756348c91d9977d57e"
+miniagent_config = "swebench_xml.yaml"
+environment_class = "docker"
+instance_filter = ""
+# Safe fallback for direct runs; run_swebench_stage.sh overrides this.
+instance_slice = "0:1"
+instance_plan_seed = 20260901
+
+[api]
+# LiteLLM requires the OpenAI provider prefix. Change the suffix to the exact
+# model ID returned by GET /v1/models on the deployed server.
+model_name = "openai/qwen3.8-27B"
+base_url_env = "QWEN_API_BASE"
+api_key_env = "QWEN_API_KEY"
+extra_headers_env = "QWEN_API_EXTRA_HEADERS"
+temperature = 1.0
+top_p = 1.0
+timeout_seconds = 300
+max_retries = 3
+seed_supported = true
+# Standard OpenAI-compatible APIs usually expose every visible output token but
+# not the EOS/stop probability. This defines a visible-token reward tilt, not a
+# strict p^alpha target unless response metadata says power_target_exact=true.
+logprob_mode = "visible_tokens"
+
+[agent]
+# The XML action config is an official mini-SWE-agent config and keeps model
+# output in message.content, where OpenAI-compatible APIs expose logprobs.
+action_mode = "text"
+step_limit = 100
+cost_limit = 0
+wall_time_limit_seconds = 7200
+# Complete MiniAgent trajectory output cap, analogous to GSM8K
+# generation.max_new_tokens. This is separate from per-action chunk_tokens.
+max_trajectory_output_tokens = 8192
+
+[budget]
+# Per instance, seed, and arm. Token limits are disabled with 0; usage is still
+# recorded per request, case, and arm. Other limits are emergency guards only.
+max_api_requests = 10000
+max_input_tokens = 0
+max_output_tokens = 0
+max_tool_calls = 20000
+max_wall_seconds = 86400
+
+[conditional_is]
+alphas = [1.0, 1.25, 1.5, 2.0, 4.0]
+candidate_counts = [2, 4, 8]
+# 5%, 10%, and 15% of agent.max_trajectory_output_tokens=8192,
+# rounded to whole tokens: 410, 819, and 1229.
+chunk_tokens = [410, 819, 1229]
+rollout_counts = [1, 2, 4]
+reference_alpha = 1.5
+reference_candidate_count = 4
+reference_chunk_tokens = 819
+reference_rollout_count = 2
+
+[mh]
+alphas = [1.0, 1.25, 1.5, 2.0, 4.0]
+updates_per_chain = [1, 2, 4, 8]
+max_suffix_actions = [1, 2, 4, "all"]
+suffix_schedules = ["full", "uniform", "inverse_length", "multiscale"]
+chains = [1, 2, 4]
+reference_alpha = 1.5
+reference_updates_per_chain = 4
+reference_max_suffix_actions = "all"
+reference_suffix_schedule = "multiscale"
+reference_chains = 1
+chunk_tokens = 819
+
+[shortlist]
+# Initial runner-up configurations for the seven-arm screen. After calibrate
+# and stress, update these plus each method's reference_* fields before screen.
+is_alpha = 1.5
+is_candidate_count = 2
+is_chunk_tokens = 819
+is_rollout_count = 1
+mh_alpha = 1.5
+mh_updates_per_chain = 4
+mh_max_suffix_actions = 2
+mh_suffix_schedule = "multiscale"
+mh_chains = 1

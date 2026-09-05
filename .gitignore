@@ -1,4 +1,6 @@
 .venv/
+.venv-swebench/
+configs/swebench_qwen38_27b.env
 .venv-*/
 venv/
 __pycache__/
