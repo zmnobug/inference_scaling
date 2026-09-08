@@ -18,11 +18,11 @@ from inference_scaling.swebench.config import (
 )
 from inference_scaling.swebench.miniagent import (
     BudgetLedger,
-    ExecutedDecision,
     ExperimentBudgetExceeded,
     MiniAgentSession,
     MiniAgentSessionFactory,
     SampledDecision,
+    SessionCheckpoint,
     decision_from_format_error,
     decision_from_message,
     miniagent_manifest,
@@ -42,7 +42,7 @@ except ImportError as exc:  # pragma: no cover - target preflight reports this
     raise ImportError("mini-swe-agent is required for SWE-bench runs") from exc
 
 
-RESULT_SCHEMA_VERSION = "swebench-is-mh-v2"
+RESULT_SCHEMA_VERSION = "swebench-is-mh-v3"
 
 
 def derive_seed(seed: int, *parts: object) -> int:
@@ -131,28 +131,38 @@ def _run_conditional_is(
         )
         rollout_logprobs: list[list[float]] = []
         rollout_summaries: list[list[dict[str, Any]]] = []
-        expected_candidate_executions: list[ExecutedDecision | None] = [
-            None for _ in candidates
-        ]
+        candidate_sessions: list[MiniAgentSession] = []
+        candidate_checkpoints: list[SessionCheckpoint] = []
+        main_checkpoint = factory.checkpoint(main)
 
         for candidate_index, candidate in enumerate(candidates):
+            candidate_seed = derive_seed(
+                seed, "is", step_index, candidate_index, "state"
+            )
+            candidate_session = factory.create_from_checkpoint(
+                main_checkpoint,
+                f"is-s{step_index}-c{candidate_index}-state",
+                candidate_seed,
+                arm.chunk_tokens,
+            )
+            candidate_session.apply_decision(candidate)
+            candidate_sessions.append(candidate_session)
+            candidate_checkpoint = factory.checkpoint(candidate_session)
+            candidate_checkpoints.append(candidate_checkpoint)
             candidate_values: list[float] = []
             candidate_summaries: list[dict[str, Any]] = []
             for rollout_index in range(arm.rollout_count):
                 branch_seed = derive_seed(
                     seed, "is", step_index, candidate_index, rollout_index
                 )
-                branch = factory.create(
+                branch = factory.create_from_checkpoint(
+                    candidate_checkpoint,
                     f"is-s{step_index}-c{candidate_index}-r{rollout_index}",
                     branch_seed,
                     arm.chunk_tokens,
                 )
                 try:
-                    branch.replay(main.executed, main.initial_digest)
                     prefix_length = len(branch.executed)
-                    executed_candidate = branch.apply_decision(candidate)
-                    if expected_candidate_executions[candidate_index] is None:
-                        expected_candidate_executions[candidate_index] = executed_candidate
                     branch.run_to_end()
                     suffix_logprob = float(
                         sum(
@@ -190,13 +200,18 @@ def _run_conditional_is(
         selected, weights, ess = select_is_candidate(
             arm.alpha, rollout_logprobs, rng
         )
-        expected = expected_candidate_executions[selected]
-        if expected is None:
-            raise RuntimeError("selected IS candidate has no completed rollout")
-        main.apply_decision(candidates[selected], expected=expected)
+        previous_main = main
+        main = candidate_sessions[selected]
+        previous_main.close()
+        for candidate_index, candidate_session in enumerate(candidate_sessions):
+            if candidate_index != selected:
+                candidate_session.close()
+        factory.discard_checkpoints(candidate_checkpoints)
         steps.append(
             {
                 "step": step_index,
+                "branch_state_mode": "docker_commit_checkpoint_v1",
+                "main_checkpoint": main_checkpoint.to_dict(),
                 "candidate_request_ids": [item.request_id for item in candidates],
                 "candidate_logprobs": [item.logprob for item in candidates],
                 "candidates": [item.to_dict() for item in candidates],
@@ -222,6 +237,36 @@ def _run_conditional_is(
     }
 
 
+def _continue_with_checkpoints(
+    factory: MiniAgentSessionFactory,
+    session: MiniAgentSession,
+) -> tuple[MiniAgentSession, list[SessionCheckpoint]]:
+    """Finish a trajectory while making every decision boundary forkable."""
+
+    checkpoints: list[SessionCheckpoint] = []
+    while session.can_query():
+        session.apply_decision(session.sample_decision())
+        checkpoint = factory.checkpoint(session)
+        checkpoints.append(checkpoint)
+    return session, checkpoints
+
+
+def _new_checkpointed_trajectory(
+    factory: MiniAgentSessionFactory,
+    *,
+    namespace: str,
+    seed: int,
+    chunk_tokens: int,
+) -> tuple[MiniAgentSession, list[SessionCheckpoint]]:
+    initial = factory.create(namespace, seed, chunk_tokens)
+    initial_checkpoint = factory.checkpoint(initial)
+    current, suffix_checkpoints = _continue_with_checkpoints(
+        factory,
+        initial,
+    )
+    return current, [initial_checkpoint, *suffix_checkpoints]
+
+
 def _run_mh_chain(
     factory: MiniAgentSessionFactory,
     arm: ExperimentArm,
@@ -235,30 +280,45 @@ def _run_mh_chain(
     ):
         raise ValueError("MH arm is missing update/schedule/chunk parameters")
     rng = random.Random(derive_seed(seed, "mh", "accept", chain_index))
-    current = factory.create(
-        f"mh-chain{chain_index}-initial",
-        derive_seed(seed, "mh", "initial", chain_index),
-        arm.chunk_tokens,
+    initial_namespace = f"mh-chain{chain_index}-initial"
+    initial_seed = derive_seed(seed, "mh", "initial", chain_index)
+    current, current_checkpoints = _new_checkpointed_trajectory(
+        factory,
+        namespace=initial_namespace,
+        seed=initial_seed,
+        chunk_tokens=arm.chunk_tokens,
     )
-    current.run_to_end()
     trace: list[dict[str, Any]] = []
 
     for update_index in range(arm.updates_per_chain):
         if not current.executed:
             break
+        if len(current_checkpoints) != len(current.executed) + 1:
+            raise RuntimeError(
+                "MH checkpoint table must contain one boundary per decision plus "
+                "the initial state"
+            )
         forward = suffix_cut_probabilities(
             len(current.executed), arm.max_suffix_actions, arm.suffix_schedule
         )
         cut = sample_suffix_cut(forward, rng)
-        proposal = factory.create(
-            f"mh-chain{chain_index}-update{update_index}",
-            derive_seed(seed, "mh", "proposal", chain_index, update_index),
+        proposal_namespace = f"mh-chain{chain_index}-update{update_index}"
+        proposal_seed = derive_seed(
+            seed, "mh", "proposal", chain_index, update_index
+        )
+        proposal = factory.create_from_checkpoint(
+            current_checkpoints[cut],
+            proposal_namespace,
+            proposal_seed,
             arm.chunk_tokens,
         )
+        proposal_suffix_checkpoints: list[SessionCheckpoint] = []
         accepted = False
         try:
-            proposal.replay(current.executed[:cut], current.initial_digest)
-            proposal.run_to_end()
+            proposal, proposal_suffix_checkpoints = _continue_with_checkpoints(
+                factory,
+                proposal,
+            )
             old_suffix_logprob = float(
                 sum(item.decision.logprob for item in current.executed[cut:])
             )
@@ -283,6 +343,8 @@ def _run_mh_chain(
                 {
                     "update": update_index,
                     "cut": cut,
+                    "branch_state_mode": "docker_commit_checkpoint_v1",
+                    "cut_checkpoint": current_checkpoints[cut].to_dict(),
                     "old_trajectory_decisions": len(current.executed),
                     "new_trajectory_decisions": len(proposal.executed),
                     "old_suffix_logprob": old_suffix_logprob,
@@ -309,13 +371,26 @@ def _run_mh_chain(
             )
             if accepted:
                 previous = current
+                discarded = current_checkpoints[cut + 1 :]
                 current = proposal
-                proposal = previous
-        finally:
+                current_checkpoints = [
+                    *current_checkpoints[: cut + 1],
+                    *proposal_suffix_checkpoints,
+                ]
+                previous.close()
+                factory.discard_checkpoints(discarded)
+            else:
+                proposal.close()
+                factory.discard_checkpoints(proposal_suffix_checkpoints)
+        except Exception:
             proposal.close()
+            factory.discard_checkpoints(proposal_suffix_checkpoints)
+            raise
 
     return current, {
         "chain": chain_index,
+        "branch_state_mode": "docker_commit_checkpoint_v1",
+        "checkpoint_count": len(current_checkpoints),
         "trace": trace,
         "attempts": len(trace),
         "accepted": sum(bool(item["accepted"]) for item in trace),

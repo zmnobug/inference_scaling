@@ -11,6 +11,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Sequence
 
+from experiments.swebench.dataset import (
+    resolve_dataset_name,
+    validate_evaluator_instances,
+)
 from experiments.swebench.io import (
     atomic_write_json,
     build_manifest,
@@ -47,9 +51,8 @@ def _load_instances(
     subset: str, split: str, revision: str
 ) -> list[dict[str, Any]]:
     from datasets import load_dataset  # type: ignore[import-untyped]
-    from minisweagent.run.benchmarks.swebench import DATASET_MAPPING
 
-    dataset_name = DATASET_MAPPING.get(subset, subset)
+    dataset_name = resolve_dataset_name(subset)
     return [
         dict(instance)
         for instance in load_dataset(dataset_name, split=split, revision=revision)
@@ -174,6 +177,14 @@ def main() -> None:
             f"{args.profile!r}; choose one of {supported} or use direct selection"
         )
     arms = _select_arms(all_arms, args.arm)
+    if (
+        any(arm.method in {"is", "mh"} for arm in arms)
+        and experiment.run.environment_class != "docker"
+    ):
+        raise ValueError(
+            "IS/MH profiles require run.environment_class='docker' for exact "
+            "checkpoint branching"
+        )
     seeds = tuple(args.seeds or experiment.run.seeds)
     workers = int(args.workers or experiment.run.workers)
     if workers <= 0:
@@ -221,6 +232,9 @@ def main() -> None:
                 sorted(Counter(str(item.get("repo", "unknown")) for item in instances).items())
             ),
         }
+    validate_evaluator_instances(
+        instances, {str(instance["instance_id"]) for instance in instances}
+    )
     output_root = (args.output or experiment.run.output_root) / experiment.run.tag / args.profile
     manifest = build_manifest(
         repository_root=REPOSITORY_ROOT,
@@ -229,6 +243,7 @@ def main() -> None:
         arms=arms,
         seeds=seeds,
         instances=instances,
+        dataset_name=resolve_dataset_name(experiment.run.subset),
         selection=selected_by,
     )
     manifest_path = output_root / "manifest.json"

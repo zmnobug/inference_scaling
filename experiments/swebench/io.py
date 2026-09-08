@@ -116,6 +116,7 @@ def build_manifest(
     arms: Sequence[ExperimentArm],
     seeds: Sequence[int],
     instances: Sequence[Mapping[str, Any]],
+    dataset_name: str,
     selection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     instance_ids = [str(instance["instance_id"]) for instance in instances]
@@ -129,6 +130,7 @@ def build_manifest(
         "tag": experiment.run.tag,
         "selection": dict(selection or {"name": "direct"}),
         "dataset": {
+            "name": dataset_name,
             "subset": experiment.run.subset,
             "split": experiment.run.split,
             "revision": experiment.run.dataset_revision,

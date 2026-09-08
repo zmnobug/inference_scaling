@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from inference_scaling.swebench.config import BudgetConfig
 from inference_scaling.swebench.miniagent import (
+    BudgetedEnvironment,
     BudgetLedger,
     _LogprobModelMixin,
     MiniAgentSession,
@@ -88,8 +89,8 @@ def _bare_session(
     model: _SessionModel, *, chunk_tokens: int, max_tokens: int
 ) -> MiniAgentSession:
     session = MiniAgentSession.__new__(MiniAgentSession)
-    session.agent = _SessionAgent(model)
-    session.environment = SimpleNamespace()
+    session.agent = cast(Any, _SessionAgent(model))
+    session.environment = cast(Any, SimpleNamespace())
     session.chunk_tokens = chunk_tokens
     session.max_trajectory_output_tokens = max_tokens
     session.executed = []
@@ -101,9 +102,9 @@ def _bare_session(
 def test_session_caps_each_request_by_remaining_trajectory_tokens() -> None:
     model = _SessionModel()
     session = _bare_session(model, chunk_tokens=64, max_tokens=100)
-    session.executed = [
+    session.executed = cast(Any, [
         SimpleNamespace(decision=SimpleNamespace(output_tokens=80))
-    ]
+    ])
 
     session.sample_decision()
 
@@ -113,9 +114,9 @@ def test_session_caps_each_request_by_remaining_trajectory_tokens() -> None:
 def test_session_records_trajectory_limit_as_terminal_reason() -> None:
     model = _SessionModel()
     session = _bare_session(model, chunk_tokens=64, max_tokens=100)
-    session.executed = [
+    session.executed = cast(Any, [
         SimpleNamespace(decision=SimpleNamespace(output_tokens=100))
-    ]
+    ])
 
     assert session.can_query() is False
     assert session.exit_status == "TrajectoryTokenLimitExceeded"
@@ -187,6 +188,50 @@ def test_unscored_output_tokens_are_rejected() -> None:
         extract_logprob_metadata(response, "request")
 
 
+def test_proxy_raw_and_normalized_usage_are_recorded_separately() -> None:
+    response = _response()
+    response["usage"].update(
+        {
+            "raw_completion_tokens": 2,
+            "normalized_completion_tokens": 1,
+            "dropped_hidden_tokens": 1,
+            "raw_total_tokens": 5,
+        }
+    )
+    metadata = extract_logprob_metadata(response, "request")
+    assert metadata["output_tokens"] == 1
+    assert metadata["raw_output_tokens"] == 2
+    assert metadata["dropped_hidden_tokens"] == 1
+
+    ledger = _ledger()
+    ledger.start_api_request()
+    ledger.finish_api_request(
+        metadata["input_tokens"],
+        metadata["output_tokens"],
+        0.1,
+        failed=False,
+        raw_output_tokens=metadata["raw_output_tokens"],
+        dropped_hidden_tokens=metadata["dropped_hidden_tokens"],
+    )
+    usage = ledger.snapshot()
+    assert usage.output_tokens == 1
+    assert usage.raw_output_tokens == 2
+    assert usage.dropped_hidden_tokens == 1
+
+
+def test_proxy_usage_counter_drift_is_rejected() -> None:
+    response = _response()
+    response["usage"].update(
+        {
+            "raw_completion_tokens": 3,
+            "normalized_completion_tokens": 1,
+            "dropped_hidden_tokens": 1,
+        }
+    )
+    with pytest.raises(ValueError, match="raw_completion_tokens"):
+        extract_logprob_metadata(response, "request")
+
+
 def test_power_target_requires_termination_probability() -> None:
     response = _response()
     with pytest.raises(ValueError, match="scored stop/EOS"):
@@ -230,3 +275,70 @@ def test_zero_token_limits_record_without_truncating() -> None:
     usage = ledger.snapshot()
     assert usage.input_tokens == 10**9
     assert usage.output_tokens == 10**8
+
+
+def test_docker_environment_checkpoint_is_audited(
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if command[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout="[]\n")
+        if command[1] == "commit":
+            return SimpleNamespace(returncode=0, stdout="sha256:checkpoint\n")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(
+        "inference_scaling.swebench.miniagent.subprocess.run", fake_run
+    )
+    raw = SimpleNamespace(
+        container_id="container-id",
+        config=SimpleNamespace(
+            executable="docker", run_args=["--rm"], cwd="/testbed"
+        ),
+        serialize=lambda: {"info": {}},
+    )
+    ledger = _ledger()
+    environment = BudgetedEnvironment(raw, ledger)
+
+    assert environment.snapshot() == "sha256:checkpoint"
+    environment.cleanup()
+
+    assert commands[0][:3] == ["docker", "inspect", "--format"]
+    assert commands[1][:2] == ["docker", "commit"]
+    assert (
+        "LABEL org.inference-scaling.swebench.checkpoint=true" in commands[1]
+    )
+    assert commands[2] == ["docker", "rm", "-f", "container-id"]
+    usage = ledger.snapshot()
+    assert usage.state_snapshots == 1
+    assert usage.snapshot_failures == 0
+
+
+def test_docker_environment_checkpoint_rejects_mounts(monkeypatch) -> None:
+    def fake_run(command, **kwargs):
+        assert command[1] == "inspect"
+        return SimpleNamespace(
+            returncode=0,
+            stdout='[{"Type":"bind","Destination":"/testbed"}]\n',
+        )
+
+    monkeypatch.setattr(
+        "inference_scaling.swebench.miniagent.subprocess.run", fake_run
+    )
+    raw = SimpleNamespace(
+        container_id="container-id",
+        config=SimpleNamespace(
+            executable="docker", run_args=["--rm"], cwd="/testbed"
+        ),
+    )
+    ledger = _ledger()
+    environment = BudgetedEnvironment(raw, ledger)
+
+    with pytest.raises(RuntimeError, match="without mounts"):
+        environment.snapshot()
+    usage = ledger.snapshot()
+    assert usage.state_snapshots == 1
+    assert usage.snapshot_failures == 1

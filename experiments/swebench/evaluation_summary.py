@@ -223,6 +223,19 @@ def summarize_evaluations(results: Path) -> dict[str, Any]:
             int(record.get("usage", {}).get("output_tokens", 0))
             for record in arm_records
         )
+        total_raw_output_tokens = sum(
+            int(
+                record.get("usage", {}).get(
+                    "raw_output_tokens",
+                    record.get("usage", {}).get("output_tokens", 0),
+                )
+            )
+            for record in arm_records
+        )
+        total_dropped_hidden_tokens = sum(
+            int(record.get("usage", {}).get("dropped_hidden_tokens", 0))
+            for record in arm_records
+        )
         interval = wilson_interval(resolved, total)
         diagnostics = _sampler_diagnostics(method, arm_records)
         warnings: list[str] = []
@@ -267,9 +280,12 @@ def summarize_evaluations(results: Path) -> dict[str, Any]:
                 "infra_failures": infra_failures,
                 "total_input_tokens": total_input_tokens,
                 "total_output_tokens": total_output_tokens,
-                "total_api_tokens": total_input_tokens + total_output_tokens,
+                "total_raw_output_tokens": total_raw_output_tokens,
+                "total_dropped_hidden_tokens": total_dropped_hidden_tokens,
+                "total_api_tokens": total_input_tokens + total_raw_output_tokens,
                 "mean_api_tokens_per_record": (
-                    (total_input_tokens + total_output_tokens) / len(arm_records)
+                    (total_input_tokens + total_raw_output_tokens)
+                    / len(arm_records)
                     if arm_records
                     else None
                 ),

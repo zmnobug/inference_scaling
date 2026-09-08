@@ -2,12 +2,13 @@
 # Secrets and the private endpoint stay in environment variables; see the env example.
 
 [run]
-tag = "qwen38-27b-is-mh-v1"
+tag = "qwen38-27b-is-mh-v2"
 output_root = "results/swebench"
 subset = "verified"
 split = "test"
-# Exact Hugging Face dataset revision used to materialize dataset.parquet.
-dataset_revision = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
+# Exact SWE-bench 5.x-compatible Hugging Face dataset revision used to
+# materialize dataset.parquet (includes image/eval_script/log_parser/eval_type).
+dataset_revision = "78f471bf655a3137b2e8a75af1501690ec009ec3"
 workers = 1
 seeds = [20260901]
 miniagent_commit = "25941c89cfbc91eb40b3f8756348c91d9977d57e"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from experiments.swebench.evaluation_summary import (
     summarize_evaluations,
@@ -14,7 +15,9 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _arm(tag: str, method: str, alpha: float, candidate_count: int | None) -> dict:
+def _arm(
+    tag: str, method: str, alpha: float, candidate_count: int | None
+) -> dict[str, Any]:
     return {
         "tag": tag,
         "config": {
@@ -31,18 +34,25 @@ def _arm(tag: str, method: str, alpha: float, candidate_count: int | None) -> di
     }
 
 
-def _record(tag: str, instance: str, tokens: int, ess: float) -> dict:
+def _record(
+    tag: str, instance: str, tokens: int, ess: float
+) -> dict[str, Any]:
     return {
         "arm_tag": tag,
         "seed": 7,
         "status": "completed",
-        "usage": {"input_tokens": tokens, "output_tokens": 10},
+        "usage": {
+            "input_tokens": tokens,
+            "output_tokens": 10,
+            "raw_output_tokens": 11,
+            "dropped_hidden_tokens": 1,
+        },
         "diagnostics": {"steps": [{"ess": ess, "weights": [0.5, 0.5]}]},
         "instance_id": instance,
     }
 
 
-def _report(resolved_ids: list[str]) -> dict:
+def _report(resolved_ids: list[str]) -> dict[str, Any]:
     all_ids = ["one", "two"]
     return {
         "total_instances": 2,
@@ -94,6 +104,8 @@ def test_evaluation_summary_ranks_and_emits_config_overrides(tmp_path: Path) -> 
     assert recommendation["config_overrides"]["shortlist.is_candidate_count"] == 4
     cheap = next(group for group in summary["groups"] if group["arm_tag"] == "is-cheap")
     assert cheap["mean_normalized_ess"] == 0.75
+    assert cheap["total_raw_output_tokens"] == 22
+    assert cheap["total_dropped_hidden_tokens"] == 2
     assert cheap["paired_vs_base"]["resolved_rate_difference"] == 0.5
     assert cheap["paired_vs_base"]["paired_instances"] == 2
 

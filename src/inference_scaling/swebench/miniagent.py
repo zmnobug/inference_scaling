@@ -33,20 +33,21 @@ class ExperimentBudgetExceeded(RuntimeError):
     """Raised when any pre-registered per-arm budget is exhausted."""
 
 
-class ReplayDiverged(RuntimeError):
-    """Raised when replaying a fixed MiniAgent prefix changes its observations."""
-
-
 @dataclass(frozen=True, slots=True)
 class UsageSnapshot:
     api_requests: int
     api_failures: int
     input_tokens: int
     output_tokens: int
+    raw_output_tokens: int
+    dropped_hidden_tokens: int
     tool_calls: int
     tool_failures: int
+    state_snapshots: int
+    snapshot_failures: int
     api_seconds: float
     tool_seconds: float
+    snapshot_seconds: float
     elapsed_seconds: float
 
 
@@ -59,10 +60,15 @@ class BudgetLedger:
         self._api_failures = 0
         self._input_tokens = 0
         self._output_tokens = 0
+        self._raw_output_tokens = 0
+        self._dropped_hidden_tokens = 0
         self._tool_calls = 0
         self._tool_failures = 0
+        self._state_snapshots = 0
+        self._snapshot_failures = 0
         self._api_seconds = 0.0
         self._tool_seconds = 0.0
+        self._snapshot_seconds = 0.0
         self._started = time.monotonic()
         self._lock = threading.Lock()
 
@@ -73,7 +79,11 @@ class BudgetLedger:
         checks = (
             ("API requests", self._api_requests, self.config.max_api_requests),
             ("input tokens", self._input_tokens, self.config.max_input_tokens),
-            ("output tokens", self._output_tokens, self.config.max_output_tokens),
+            (
+                "raw output tokens",
+                self._raw_output_tokens,
+                self.config.max_output_tokens,
+            ),
             ("tool calls", self._tool_calls, self.config.max_tool_calls),
         )
         for label, actual, maximum in checks:
@@ -101,12 +111,29 @@ class BudgetLedger:
         elapsed_seconds: float,
         *,
         failed: bool,
+        raw_output_tokens: int | None = None,
+        dropped_hidden_tokens: int = 0,
     ) -> None:
-        if input_tokens < 0 or output_tokens < 0:
+        raw_output_tokens = (
+            output_tokens if raw_output_tokens is None else raw_output_tokens
+        )
+        if (
+            input_tokens < 0
+            or output_tokens < 0
+            or raw_output_tokens < 0
+            or dropped_hidden_tokens < 0
+        ):
             raise ValueError("API token counts must be non-negative")
+        if raw_output_tokens != output_tokens + dropped_hidden_tokens:
+            raise ValueError(
+                "raw output tokens must equal normalized output tokens plus "
+                "dropped hidden tokens"
+            )
         with self._lock:
             self._input_tokens += input_tokens
             self._output_tokens += output_tokens
+            self._raw_output_tokens += raw_output_tokens
+            self._dropped_hidden_tokens += dropped_hidden_tokens
             self._api_seconds += max(0.0, elapsed_seconds)
             self._api_failures += int(failed)
             self._check_locked()
@@ -124,6 +151,14 @@ class BudgetLedger:
             self._tool_failures += int(failed)
             self._check_locked()
 
+    def finish_state_snapshot(
+        self, elapsed_seconds: float, *, failed: bool
+    ) -> None:
+        with self._lock:
+            self._state_snapshots += 1
+            self._snapshot_failures += int(failed)
+            self._snapshot_seconds += max(0.0, elapsed_seconds)
+
     def check(self) -> None:
         with self._lock:
             self._check_locked()
@@ -135,10 +170,15 @@ class BudgetLedger:
                 api_failures=self._api_failures,
                 input_tokens=self._input_tokens,
                 output_tokens=self._output_tokens,
+                raw_output_tokens=self._raw_output_tokens,
+                dropped_hidden_tokens=self._dropped_hidden_tokens,
                 tool_calls=self._tool_calls,
                 tool_failures=self._tool_failures,
+                state_snapshots=self._state_snapshots,
+                snapshot_failures=self._snapshot_failures,
                 api_seconds=self._api_seconds,
                 tool_seconds=self._tool_seconds,
+                snapshot_seconds=self._snapshot_seconds,
                 elapsed_seconds=self._elapsed(),
             )
 
@@ -192,7 +232,101 @@ class BudgetedEnvironment:
                 ] = result.stdout.strip()
         return payload
 
+    @property
+    def container_id(self) -> str | None:
+        return getattr(self._environment, "container_id", None)
+
+    @property
+    def executable(self) -> str:
+        return str(getattr(self.config, "executable", "docker"))
+
+    def snapshot(self) -> str:
+        """Commit an immutable Docker root-filesystem checkpoint."""
+
+        container_id = self.container_id
+        if not container_id:
+            raise RuntimeError(
+                "exact IS/MH state branching requires a Docker environment"
+            )
+        run_args = tuple(str(value) for value in getattr(self.config, "run_args", ()))
+        if any(
+            value in {"-v", "--volume", "--mount"}
+            or value.startswith("--volume=")
+            or value.startswith("--mount=")
+            for value in run_args
+        ):
+            raise RuntimeError(
+                "Docker checkpoint branching does not support bind mounts or volumes"
+            )
+        started = time.monotonic()
+        failed = True
+        try:
+            mounts = subprocess.run(
+                [
+                    self.executable,
+                    "inspect",
+                    "--format",
+                    "{{json .Mounts}}",
+                    container_id,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+            if json.loads(mounts.stdout or "[]"):
+                raise RuntimeError(
+                    "Docker checkpoint branching requires a container without "
+                    "mounts because docker commit excludes mounted data"
+                )
+            result = subprocess.run(
+                [
+                    self.executable,
+                    "commit",
+                    "--change",
+                    "LABEL org.inference-scaling.swebench.checkpoint=true",
+                    container_id,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=True,
+            )
+            output_lines = [
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            ]
+            image_id = output_lines[-1] if output_lines else ""
+            if not image_id.startswith("sha256:"):
+                raise RuntimeError("Docker commit did not return a valid image ID")
+            failed = False
+            return image_id
+        finally:
+            self._ledger.finish_state_snapshot(
+                time.monotonic() - started, failed=failed
+            )
+
     def cleanup(self) -> None:
+        container_id = self.container_id
+        if container_id:
+            result = subprocess.run(
+                [self.executable, "rm", "-f", container_id],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if result.returncode == 0 or "No such container" in getattr(
+                result, "stderr", ""
+            ):
+                try:
+                    self._environment.container_id = None
+                except Exception:
+                    pass
+            else:
+                cleanup = getattr(self._environment, "cleanup", None)
+                if cleanup is not None:
+                    cleanup()
+            return
         cleanup = getattr(self._environment, "cleanup", None)
         if cleanup is not None:
             cleanup()
@@ -213,7 +347,15 @@ def _model_dump(value: Any) -> dict[str, Any]:
     raise TypeError(f"cannot serialize API response of type {type(value).__name__}")
 
 
-def _usage_counts(response: Any) -> tuple[int, int]:
+@dataclass(frozen=True, slots=True)
+class ApiUsage:
+    input_tokens: int
+    output_tokens: int
+    raw_output_tokens: int
+    dropped_hidden_tokens: int
+
+
+def _usage_details(response: Any) -> ApiUsage:
     usage = _get(response, "usage")
     if usage is None:
         raise ValueError("API response is missing usage token counts")
@@ -221,9 +363,57 @@ def _usage_counts(response: Any) -> tuple[int, int]:
     output_tokens = _get(
         usage, "completion_tokens", _get(usage, "output_tokens")
     )
+    normalized_output_tokens = _get(
+        usage, "normalized_completion_tokens", output_tokens
+    )
+    raw_output_tokens = _get(
+        usage, "raw_completion_tokens", normalized_output_tokens
+    )
+    dropped_hidden_tokens = _get(
+        usage,
+        "dropped_hidden_tokens",
+        int(raw_output_tokens) - int(normalized_output_tokens)
+        if raw_output_tokens is not None and normalized_output_tokens is not None
+        else 0,
+    )
     if input_tokens is None or output_tokens is None:
         raise ValueError("API response usage is missing input/output token counts")
-    return int(input_tokens), int(output_tokens)
+    details = ApiUsage(
+        input_tokens=int(input_tokens),
+        output_tokens=int(output_tokens),
+        raw_output_tokens=int(raw_output_tokens),
+        dropped_hidden_tokens=int(dropped_hidden_tokens),
+    )
+    if min(
+        details.input_tokens,
+        details.output_tokens,
+        details.raw_output_tokens,
+        details.dropped_hidden_tokens,
+    ) < 0:
+        raise ValueError("API usage token counts must be non-negative")
+    if int(normalized_output_tokens) != details.output_tokens:
+        raise ValueError(
+            "normalized_completion_tokens differs from completion_tokens"
+        )
+    if (
+        details.raw_output_tokens
+        != details.output_tokens + details.dropped_hidden_tokens
+    ):
+        raise ValueError(
+            "raw_completion_tokens must equal completion_tokens plus "
+            "dropped_hidden_tokens"
+        )
+    raw_total_tokens = _get(usage, "raw_total_tokens")
+    if raw_total_tokens is not None and int(raw_total_tokens) != (
+        details.input_tokens + details.raw_output_tokens
+    ):
+        raise ValueError("raw_total_tokens is inconsistent with raw token counts")
+    return details
+
+
+def _usage_counts(response: Any) -> tuple[int, int]:
+    details = _usage_details(response)
+    return details.input_tokens, details.output_tokens
 
 
 def extract_logprob_metadata(
@@ -283,7 +473,9 @@ def extract_logprob_metadata(
     if reconstructed != content:
         raise ValueError("sampled logprob tokens do not reconstruct response content")
 
-    input_tokens, output_tokens = _usage_counts(response)
+    usage = _usage_details(response)
+    input_tokens = usage.input_tokens
+    output_tokens = usage.output_tokens
     finish_reason = str(_get(choice, "finish_reason", "") or "")
     if finish_reason not in {"stop", "length"}:
         raise ValueError(f"unsupported API finish_reason for logprob reward: {finish_reason!r}")
@@ -351,6 +543,8 @@ def extract_logprob_metadata(
         "unscored_output_tokens": unscored_output_tokens,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "raw_output_tokens": usage.raw_output_tokens,
+        "dropped_hidden_tokens": usage.dropped_hidden_tokens,
         "finish_reason": finish_reason,
         "response_id": str(_get(response, "id", "") or ""),
         "response_model": str(_get(response, "model", "") or ""),
@@ -429,16 +623,20 @@ class _LogprobModelMixin:
             )
         except Exception:
             try:
-                input_tokens, output_tokens = (
-                    _usage_counts(response) if response is not None else (0, 0)
+                usage = (
+                    _usage_details(response)
+                    if response is not None
+                    else ApiUsage(0, 0, 0, 0)
                 )
             except Exception:
-                input_tokens, output_tokens = 0, 0
+                usage = ApiUsage(0, 0, 0, 0)
             self._ledger.finish_api_request(
-                input_tokens,
-                output_tokens,
+                usage.input_tokens,
+                usage.output_tokens,
                 time.monotonic() - started,
                 failed=True,
+                raw_output_tokens=usage.raw_output_tokens,
+                dropped_hidden_tokens=usage.dropped_hidden_tokens,
             )
             raise
         self._ledger.finish_api_request(
@@ -446,6 +644,8 @@ class _LogprobModelMixin:
             metadata["output_tokens"],
             time.monotonic() - started,
             failed=False,
+            raw_output_tokens=metadata["raw_output_tokens"],
+            dropped_hidden_tokens=metadata["dropped_hidden_tokens"],
         )
         try:
             response._inference_scaling_metadata = metadata
@@ -505,6 +705,8 @@ class SampledDecision:
     tokens: tuple[str, ...]
     input_tokens: int
     output_tokens: int
+    raw_output_tokens: int
+    dropped_hidden_tokens: int
     request_id: str
     response_id: str
     response_model: str
@@ -534,6 +736,8 @@ class SampledDecision:
             "tokens": list(self.tokens),
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "raw_output_tokens": self.raw_output_tokens,
+            "dropped_hidden_tokens": self.dropped_hidden_tokens,
             "request_id": self.request_id,
             "response_id": self.response_id,
             "response_model": self.response_model,
@@ -565,6 +769,31 @@ class ExecutedDecision:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class SessionCheckpoint:
+    """Agent state plus an immutable Docker root-filesystem image."""
+
+    image_id: str
+    messages: tuple[dict[str, Any], ...]
+    executed: tuple[ExecutedDecision, ...]
+    n_calls: int
+    cost: float
+    n_consecutive_format_errors: int
+    initial_digest: str
+    model_request_index: int
+    agent_elapsed_seconds: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "image_id": self.image_id,
+            "message_digest": message_digest(self.messages),
+            "decision_count": len(self.executed),
+            "trajectory_output_tokens": sum(
+                item.decision.output_tokens for item in self.executed
+            ),
+        }
+
+
 def _metadata_from_messages(messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     for message in messages:
         metadata = message.get("extra", {}).get("inference_scaling")
@@ -583,6 +812,8 @@ def decision_from_message(message: dict[str, Any]) -> SampledDecision:
         tokens=tuple(str(value) for value in metadata["sampled_tokens"]),
         input_tokens=int(metadata["input_tokens"]),
         output_tokens=int(metadata["output_tokens"]),
+        raw_output_tokens=int(metadata["raw_output_tokens"]),
+        dropped_hidden_tokens=int(metadata["dropped_hidden_tokens"]),
         request_id=str(metadata["request_id"]),
         response_id=str(metadata["response_id"]),
         response_model=str(metadata["response_model"]),
@@ -613,6 +844,8 @@ def decision_from_format_error(exc: FormatError) -> SampledDecision:
         tokens=tuple(str(value) for value in metadata["sampled_tokens"]),
         input_tokens=int(metadata["input_tokens"]),
         output_tokens=int(metadata["output_tokens"]),
+        raw_output_tokens=int(metadata["raw_output_tokens"]),
+        dropped_hidden_tokens=int(metadata["dropped_hidden_tokens"]),
         request_id=str(metadata["request_id"]),
         response_id=str(metadata["response_id"]),
         response_model=str(metadata["response_model"]),
@@ -767,7 +1000,6 @@ class MiniAgentSession:
     def apply_decision(
         self,
         decision: SampledDecision,
-        expected: ExecutedDecision | None = None,
     ) -> ExecutedDecision:
         if self.terminal:
             raise RuntimeError("cannot apply a decision to a terminal session")
@@ -778,8 +1010,6 @@ class MiniAgentSession:
                 f"{projected_tokens} > {self.max_trajectory_output_tokens}"
             )
         context_digest = message_digest(self.agent.messages)
-        if expected is not None and context_digest != expected.context_digest:
-            raise ReplayDiverged("MiniAgent replay context differs before action")
 
         start = len(self.agent.messages)
         self.agent.n_calls += 1
@@ -809,8 +1039,6 @@ class MiniAgentSession:
             delta_digest=delta_digest,
             terminal=self.terminal,
         )
-        if expected is not None and delta_digest != expected.delta_digest:
-            raise ReplayDiverged("MiniAgent tool observation differs during replay")
         self.executed.append(executed)
         return executed
 
@@ -819,13 +1047,52 @@ class MiniAgentSession:
             self.apply_decision(self.sample_decision())
         return self
 
-    def replay(self, prefix: Sequence[ExecutedDecision], expected_initial_digest: str) -> None:
-        if self.initial_digest != expected_initial_digest:
-            raise ReplayDiverged("MiniAgent initial prompt differs during replay")
-        for item in prefix:
-            if item.terminal:
-                raise ValueError("cannot replay a prefix containing a terminal decision")
-            self.apply_decision(item.decision, expected=item)
+    def make_checkpoint(self, image_id: str) -> SessionCheckpoint:
+        return SessionCheckpoint(
+            image_id=image_id,
+            messages=tuple(copy.deepcopy(self.agent.messages)),
+            executed=tuple(copy.deepcopy(self.executed)),
+            n_calls=int(self.agent.n_calls),
+            cost=float(self.agent.cost),
+            n_consecutive_format_errors=int(
+                self.agent.n_consecutive_format_errors
+            ),
+            initial_digest=self.initial_digest,
+            model_request_index=int(
+                getattr(self.agent.model, "_request_index", 0)
+            ),
+            agent_elapsed_seconds=max(
+                0.0, time.time() - float(self.agent._start_time)
+            ),
+        )
+
+    def restore_checkpoint(
+        self,
+        checkpoint: SessionCheckpoint,
+        *,
+        restore_model_request_index: bool,
+    ) -> None:
+        if self.executed:
+            raise RuntimeError("cannot restore over a non-empty session")
+        self.agent.messages = list(copy.deepcopy(checkpoint.messages))
+        self.executed = list(copy.deepcopy(checkpoint.executed))
+        self.agent.n_calls = checkpoint.n_calls
+        self.agent.cost = checkpoint.cost
+        self.agent.n_consecutive_format_errors = (
+            checkpoint.n_consecutive_format_errors
+        )
+        self.initial_digest = checkpoint.initial_digest
+        self.agent._start_time = time.time() - checkpoint.agent_elapsed_seconds
+        if restore_model_request_index:
+            setattr(
+                self.agent.model,
+                "_request_index",
+                checkpoint.model_request_index,
+            )
+        if message_digest(self.agent.messages) != message_digest(
+            checkpoint.messages
+        ):
+            raise RuntimeError("restored MiniAgent messages changed")
 
     def serialize(self) -> dict[str, Any]:
         return self.agent.serialize(
@@ -868,6 +1135,7 @@ class MiniAgentSessionFactory:
         self.instance = dict(instance)
         self.ledger = ledger
         self._sessions: list[MiniAgentSession] = []
+        self._snapshot_images: list[tuple[str, str]] = []
         self.runtime = experiment.api.resolve_runtime(environ)
         self.mini_config = get_config_from_spec(experiment.run.miniagent_config)
         self.mini_config = copy.deepcopy(self.mini_config)
@@ -915,8 +1183,13 @@ class MiniAgentSessionFactory:
             **section,
         )
 
-    def create(self, namespace: str, seed: int, chunk_tokens: int) -> MiniAgentSession:
-        raw_environment = get_sb_environment(self.mini_config, self.instance)
+    def _create_session(
+        self,
+        raw_environment,
+        namespace: str,
+        seed: int,
+        chunk_tokens: int,
+    ) -> MiniAgentSession:
         environment = BudgetedEnvironment(raw_environment, self.ledger)
         model = self.make_model(namespace, seed, chunk_tokens)
         agent = DefaultAgent(model, environment, **self.mini_config.get("agent", {}))
@@ -932,9 +1205,82 @@ class MiniAgentSessionFactory:
         self._sessions.append(session)
         return session
 
+    def create(self, namespace: str, seed: int, chunk_tokens: int) -> MiniAgentSession:
+        raw_environment = get_sb_environment(self.mini_config, self.instance)
+        return self._create_session(
+            raw_environment, namespace, seed, chunk_tokens
+        )
+
+    def checkpoint(self, session: MiniAgentSession) -> SessionCheckpoint:
+        if session.closed:
+            raise RuntimeError("cannot checkpoint a closed MiniAgent session")
+        image_id = session.environment.snapshot()
+        self._snapshot_images.append(
+            (session.environment.executable, image_id)
+        )
+        return session.make_checkpoint(image_id)
+
+    def create_from_checkpoint(
+        self,
+        checkpoint: SessionCheckpoint,
+        namespace: str,
+        seed: int,
+        chunk_tokens: int,
+        *,
+        restore_model_request_index: bool = False,
+    ) -> MiniAgentSession:
+        if self.experiment.run.environment_class != "docker":
+            raise RuntimeError(
+                "exact IS/MH checkpoint branching currently requires Docker"
+            )
+        instance = dict(self.instance)
+        instance["image_name"] = checkpoint.image_id
+        config = copy.deepcopy(self.mini_config)
+        config.setdefault("run", {}).pop("env_startup_command", None)
+        raw_environment = get_sb_environment(config, instance)
+        session = self._create_session(
+            raw_environment, namespace, seed, chunk_tokens
+        )
+        session.restore_checkpoint(
+            checkpoint,
+            restore_model_request_index=restore_model_request_index,
+        )
+        return session
+
+    def discard_checkpoints(
+        self, checkpoints: Sequence[SessionCheckpoint]
+    ) -> None:
+        for checkpoint in reversed(checkpoints):
+            matches = [
+                item
+                for item in self._snapshot_images
+                if item[1] == checkpoint.image_id
+            ]
+            if not matches:
+                continue
+            executable, image_id = matches[-1]
+            result = subprocess.run(
+                [executable, "image", "rm", image_id],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if result.returncode == 0:
+                self._snapshot_images.remove((executable, image_id))
+
     def close_all(self) -> None:
         for session in self._sessions:
             session.close()
+        for executable, image_id in reversed(self._snapshot_images):
+            subprocess.run(
+                [executable, "image", "rm", image_id],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        self._snapshot_images.clear()
 
 
 def miniagent_manifest(experiment: ExperimentConfig) -> dict[str, Any]:
@@ -946,5 +1292,6 @@ def miniagent_manifest(experiment: ExperimentConfig) -> dict[str, Any]:
         "max_trajectory_output_tokens": (
             experiment.agent.max_trajectory_output_tokens
         ),
+        "branch_state_mode": "docker_commit_checkpoint_v1",
         "api": _redact(asdict(experiment.api)),
     }

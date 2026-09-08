@@ -9,6 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from experiments.swebench.dataset import (
+    resolve_dataset_name,
+    validate_evaluator_instances,
+)
 from inference_scaling.swebench.config import (
     MINI_SWE_AGENT_COMMIT,
     SWE_BENCH_VERSION,
@@ -72,13 +76,17 @@ def main() -> None:
 
     if not args.skip_dataset:
         from datasets import load_dataset  # type: ignore[import-untyped]
-        from minisweagent.run.benchmarks.swebench import DATASET_MAPPING
 
-        dataset_name = DATASET_MAPPING.get(experiment.run.subset, experiment.run.subset)
+        dataset_name = resolve_dataset_name(experiment.run.subset)
         dataset = load_dataset(
             dataset_name,
             split=experiment.run.split,
             revision=experiment.run.dataset_revision,
+        )
+        instances = [dict(instance) for instance in dataset]
+        validate_evaluator_instances(
+            instances,
+            {str(instance["instance_id"]) for instance in instances},
         )
         checks["dataset"] = {
             "name": dataset_name,
@@ -122,6 +130,8 @@ def main() -> None:
             "logprob_tokens": len(metadata["sampled_token_logprobs"]),
             "input_tokens": metadata["input_tokens"],
             "output_tokens": metadata["output_tokens"],
+            "raw_output_tokens": metadata["raw_output_tokens"],
+            "dropped_hidden_tokens": metadata["dropped_hidden_tokens"],
             "scored_output_tokens": metadata["scored_output_tokens"],
             "unscored_output_tokens": metadata["unscored_output_tokens"],
             "termination_status": metadata["termination_status"],

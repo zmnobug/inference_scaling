@@ -44,6 +44,21 @@ def summarize_results(results: Path) -> dict[str, Any]:
                 "total_input_tokens": sum(item["input_tokens"] for item in usages),
                 "mean_output_tokens": _mean([item["output_tokens"] for item in usages]),
                 "total_output_tokens": sum(item["output_tokens"] for item in usages),
+                "mean_raw_output_tokens": _mean(
+                    [item.get("raw_output_tokens", item["output_tokens"]) for item in usages]
+                ),
+                "total_raw_output_tokens": sum(
+                    item.get("raw_output_tokens", item["output_tokens"])
+                    for item in usages
+                ),
+                "total_dropped_hidden_tokens": sum(
+                    item.get("dropped_hidden_tokens", 0) for item in usages
+                ),
+                "total_api_tokens": sum(
+                    item["input_tokens"]
+                    + item.get("raw_output_tokens", item["output_tokens"])
+                    for item in usages
+                ),
                 "mean_tool_calls": _mean([item["tool_calls"] for item in usages]),
                 "total_tool_calls": sum(item["tool_calls"] for item in usages),
                 "mean_api_failures": _mean(
@@ -58,6 +73,15 @@ def summarize_results(results: Path) -> dict[str, Any]:
                 "total_tool_failures": sum(
                     item.get("tool_failures", 0) for item in usages
                 ),
+                "mean_state_snapshots": _mean(
+                    [item.get("state_snapshots", 0) for item in usages]
+                ),
+                "total_state_snapshots": sum(
+                    item.get("state_snapshots", 0) for item in usages
+                ),
+                "total_snapshot_failures": sum(
+                    item.get("snapshot_failures", 0) for item in usages
+                ),
                 "mean_api_seconds": _mean(
                     [item.get("api_seconds", 0.0) for item in usages]
                 ),
@@ -69,6 +93,12 @@ def summarize_results(results: Path) -> dict[str, Any]:
                 ),
                 "total_tool_seconds": sum(
                     item.get("tool_seconds", 0.0) for item in usages
+                ),
+                "mean_snapshot_seconds": _mean(
+                    [item.get("snapshot_seconds", 0.0) for item in usages]
+                ),
+                "total_snapshot_seconds": sum(
+                    item.get("snapshot_seconds", 0.0) for item in usages
                 ),
                 "mean_wall_seconds": _mean([item["elapsed_seconds"] for item in usages]),
                 "total_wall_seconds": sum(item["elapsed_seconds"] for item in usages),

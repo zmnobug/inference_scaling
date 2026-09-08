@@ -31,7 +31,7 @@ Metropolis--Hastings（MH）的实验协议。模型使用已经部署的 `qwen3
 | 基础采样策略 | `temperature=1`、`top_p=1`、禁用 top-k；候选和 rollout 使用同一个 API 模型 |
 | 奖励 | API 返回的可见生成 token 累计 logprob；不读取 gold patch、测试结果或任务标签 |
 | 最终评测 | MiniAgent 产出的补丁按固定的 SWE-bench 官方评测流程计算 `resolved` |
-| 工具环境 | 每个候选 rollout、MH proposal 和独立链使用隔离的仓库工作区 |
+| 工具环境 | Docker root filesystem checkpoint；每个候选 rollout、MH proposal 和独立链使用隔离的精确工作区状态 |
 | 主输出 | 每个实例每个随机种子只提交一个补丁；pass@k 必须另列，不能混入 pass@1 |
 
 官方 SWE-bench evaluator 是任务结果判定器，不是新增 Agent harness。它只在轨迹结束后评测最终补丁，不能把
@@ -96,8 +96,9 @@ IS 的候选 action 在隔离工作区中继续运行 MiniAgent rollout。MH 的
 - 初始仓库镜像、安装步骤和环境变量白名单；
 - 最终 patch 的提取和提交方式。
 
-每个隔离工作区必须从固定基础镜像或已验证快照创建。不得让候选之间共享未提交文件、进程、端口或工具缓存。
-模型 API 可以共享，但每个请求必须有唯一的实验 request ID。
+每个隔离工作区必须从固定基础镜像或当前 action 边界的 immutable Docker checkpoint 创建。checkpoint 前校验容器没有
+mount，因为 `docker commit` 不保存挂载数据；候选不能共享未提交文件、进程、端口或工具缓存。模型 API 可以共享，
+但每个请求必须有唯一的实验 request ID。IS/MH 正式 profile 因而只支持 Docker environment。
 
 ## 5. IS 方法
 
@@ -111,11 +112,12 @@ log weight 为
 \left[(\alpha-1)L(z_m,u_{mk}\mid h)\right].
 ```
 
-按归一化后的 $`\widehat w_m`$ 重采样一个候选，并且只在主工作区执行该候选 action。若算法在后续决策点继续
-使用 IS，则已选 action 的真实工具结果进入新的历史，未选候选工作区全部关闭。
+按归一化后的 $`\widehat w_m`$ 重采样一个候选，并直接把已执行候选的容器和 MiniAgent 状态提升为主链；不得在旧主
+容器中再次执行该 action。若算法在后续决策点继续使用 IS，则已选 action 的真实工具结果进入新的历史，未选候选
+工作区全部关闭。
 
-实现中的每个 rollout logprob 是候选 action 与其后续 action 的累计值；候选本身的 logprob 不能从权重中遗漏，
-否则就不再对应完整后续轨迹 $`(z_m,u_{mk})`$ 的奖励。
+实现中的每个 rollout logprob 是候选 action 与其后续 action 的累计值；候选本身的 logprob 必须恰好计入一次，
+既不能遗漏也不能在 suffix 中重复累计，否则就不再对应完整后续轨迹 $`(z_m,u_{mk})`$ 的奖励。
 
 ### 5.1 IS 消融参数
 
@@ -174,8 +176,9 @@ transport batch。chunk 必须在 MiniAgent 可以解析的完整 assistant acti
 后缀分配概率。proposal 改变轨迹 action 数后，必须在新轨迹上重新计算同一切点的反向概率；反向概率为零时该
 proposal 必须拒绝。
 
-工具操作要求在快照上重新执行。正式实验假定同一基础镜像、相同历史与相同命令得到可比较的工具状态；网络访问、
-系统时间等非确定性输入必须关闭或记录。只在尚未执行的单条 action 内做局部 MH 可以用于 API smoke，但它只采样局部
+历史工具操作不从基础镜像重放。运行时在每个合法 action 边界保存 root filesystem 与 MiniAgent message/counter 状态，
+proposal 直接从切点 checkpoint 启动；接受时提升 proposal 状态，拒绝时保留当前状态。网络访问、系统时间和遗留后台
+进程等非 checkpoint 输入必须关闭或记录。只在尚未执行的单条 action 内做局部 MH 可以用于 API smoke，但它只采样局部
 action 奖励倾斜目标，不等于完整 Agent 轨迹目标，不能混入正式质量表；只有 exact 模式下才能把该局部目标写成
 $`p(a\mid h)^\alpha`$。
 
@@ -227,14 +230,14 @@ $`p(a\mid h)^\alpha`$。
 
 实验不做 token 成本配平，但同时记录三种资源用量：
 
-1. API 输入 token、输出 token 和总计费 token；
+1. API 输入 token、规范化可见输出 token、服务端原始输出 token、被过滤隐藏 token 和总计费 token；
 2. API 请求数、模型服务墙钟和端到端 Agent 墙钟；
 3. 工具调用数、工具执行时间和隔离工作区数量。
 
 `agent.max_trajectory_output_tokens` 是每条轨迹的协议性生成上限；`budget.max_input_tokens` 与
 `budget.max_output_tokens` 仍设为 `0`，表示不增加跨候选、跨 rollout 的共享 token 预算。API 请求数、工具调用数和
-墙钟仍保留很高的紧急上限，只用于阻止死循环。每个请求、case 和 arm 都保存 input/output token、API 时间和工具时间，
-结果按自然成本报告。
+墙钟仍保留很高的紧急上限，只用于阻止死循环。每个请求、case 和 arm 都保存 input/output token、API 时间、工具时间
+与 checkpoint 次数/耗时。轨迹上限使用规范化的 MiniAgent 可见 token；计费和成本排序使用原始 output token。
 
 IS 的粗略生成成本随 `candidate_count * rollouts_per_candidate` 增长；MH 成本近似为
 
@@ -376,7 +379,8 @@ logprob、request ID、服务端模型字段、计数和错误信息都进入审
 | `alpha` 与长轨迹导致权重/接受率退化 | 使用 log-space 计算；先筛选 `1.0--2.0`，`4.0` 作为压力点 |
 | 累计 logprob 偏向短轨迹 | 报告长度与终止原因；不静默改用平均 logprob |
 | rollout/proposal 工具状态互相污染 | 每个分支使用独立快照和进程命名空间 |
-| 工具或测试存在非确定性 | 禁网并固定镜像；记录差异，无法控制时把 exact MH 结论降级 |
+| 工具或测试存在非确定性 | 从真实 action 边界 checkpoint 派生分支，不从基础镜像重放历史命令；仍不可 checkpoint 的状态需记录并降级结论 |
+| vLLM 自动解析原生 tool call | 文本/XML MiniAgent 服务必须关闭 `--enable-auto-tool-choice` 和 `--tool-call-parser`，保留原始文本及 logprob |
 | API 限流改变墙钟 | 记录排队、重试和服务端时间；质量与墙钟分开解释 |
 | 调参过拟合 SWE-bench | 固定互斥 tuning/confirmation 实例，确认前冻结配置 |
 | 多链后挑最好结果 | 禁止用于 pass@1；另列 Best-of-N/pass@k |
@@ -391,7 +395,7 @@ logprob、request ID、服务端模型字段、计数和错误信息都进入审
 
 - mini-SWE-agent `2.4.6`，commit `25941c89cfbc91eb40b3f8756348c91d9977d57e`；
 - SWE-bench evaluator `5.0.1`；
-- SWE-bench Verified dataset revision `c104f840cc67f8b6eec6f759ebc8b2693d585d4a`；
+- SWE-bench Verified `SWE-bench/SWE-bench_Verified` dataset revision `78f471bf655a3137b2e8a75af1501690ec009ec3`；
 - LiteLLM `1.99.0`、OpenAI Python client `2.54.0` 和 Docker SDK `7.2.0`；
 - MiniAgent 官方 `swebench_xml.yaml`，不使用其他 Agent harness。
 
@@ -411,13 +415,15 @@ cp configs/swebench_qwen38_27b.env.example configs/swebench_qwen38_27b.env
 
 其中 `QWEN_API_BASE` 必须包含 OpenAI-compatible `/v1` 路径，`QWEN_API_KEY` 只保存在目标机。配置中的
 `api.model_name` 必须与服务端实际模型 ID 对齐，并保留 LiteLLM 的 `openai/` provider 前缀。
+vLLM 必须关闭自动工具调用解析，即启动命令不得包含 `--enable-auto-tool-choice` 或 `--tool-call-parser`；本实验使用
+MiniAgent 官方 text/XML action 协议，不向 API 发送原生 tools。
 
 先运行 3 个实例、5 个预注册 arm 的 smoke：
 
 ```bash
 ./run_swebench_stage.sh smoke configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v1/smoke --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v2/smoke --max-workers 4
 ```
 
 预检会验证 Python/依赖、Docker、数据集和一次真实 API logprob 响应。任一 token 缺 logprob 时会在启动正式 Docker
@@ -427,9 +433,9 @@ cp configs/swebench_qwen38_27b.env.example configs/swebench_qwen38_27b.env
 ./run_swebench_stage.sh calibrate configs/swebench_qwen38_27b_api.toml
 ./run_swebench_stage.sh stress configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v1/calibrate --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v2/calibrate --max-workers 4
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v1/stress --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v2/stress --max-workers 4
 ```
 
 每次 evaluator 完成后会生成 `evaluation_summary.json`。根据 calibrate 的临时建议与 stress 的 ESS、接受率和失败警告，
@@ -439,13 +445,13 @@ cp configs/swebench_qwen38_27b.env.example configs/swebench_qwen38_27b.env
 ```bash
 ./run_swebench_stage.sh screen configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v1/screen --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v2/screen --max-workers 4
 ./run_swebench_stage.sh seed_check configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v1/seed_check --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v2/seed_check --max-workers 4
 ./run_swebench_stage.sh confirm configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v1/confirm --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v2/confirm --max-workers 4
 ```
 
 `run_swebench_50.sh` 是最后一条 `confirm` 命令的兼容快捷入口。任一阶段增加 `--dry-run` 可只查看 arm、实例、seed 和
@@ -454,24 +460,35 @@ case 数；`--workers 2` 可调整并发。直接调用 `run_swebench_ablation.s
 结果位于
 `results/swebench/<tag>/<profile>/<arm>/seed-<seed>/`。每个实例分别保存 `record.json` 与原版 MiniAgent
 `trajectory.json`；profile 根目录保存本次选中数据行的 `dataset.parquet`，官方 evaluator 直接读取这份固定快照。
+若评测旧 `c104f840...` 诊断结果，评测器会保留原文件并生成 `dataset.evaluation.parquet`，从固定的 5.x revision 补齐
+`image/eval_script/log_parser/eval_type`；`evaluation/dataset_provenance.json` 保存双方 hash 和身份字段校验结果。不同
+dataset revision 或 `v1/v2` tag 的结果不得合并。
 每个 arm/seed 自动重建 `preds.json`，profile 结束时自动更新 `inference_summary.json`，其中包含 input/output token、
 API 请求、工具调用和各项耗时的总量与均值。官方评测完成后另写 `evaluation_summary.json`，包含 resolved、Wilson 区间、
 失败分类、采样诊断、确定性排名和建议配置字段。跨分支的共享 token 预算只记录不截断；每条轨迹仍遵守
 `agent.max_trajectory_output_tokens` 协议上限，达到上限会记录 `TrajectoryTokenLimitExceeded`。相同配置、数据行、arm 和 seed 的完整结果会自动
 跳过；运行矩阵或数据哈希不同时必须使用新 tag，避免混合结果。
 
+checkpoint 镜像带有 `org.inference-scaling.swebench.checkpoint=true` 标签，正常结束时自动删除。进程被强制终止后，可在
+确认没有同仓库实验运行时清理未被容器引用的残留镜像：
+
+```bash
+docker image prune -f \
+  --filter label=org.inference-scaling.swebench.checkpoint=true
+```
+
 生成推理成本汇总：
 
 ```bash
 .venv-swebench/bin/python -m experiments.swebench.summarize \
-  --results results/swebench/qwen38-27b-is-mh-v1/screen
+  --results results/swebench/qwen38-27b-is-mh-v2/screen
 ```
 
 使用固定官方 evaluator 评测某个 profile：
 
 ```bash
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v1/screen --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v2/screen --max-workers 4
 ```
 
 evaluation 日志写入 profile 目录下的 `evaluation/`。先加 `--dry-run` 可以检查每个 arm/seed 的 evaluator 命令。
