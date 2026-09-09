@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 
@@ -17,6 +17,25 @@ STAGE_INSTANCE_COUNTS = {
     "seed_check": 20,
     "confirm": 50,
 }
+
+
+def select_incomplete_instance_batch(
+    instances: Sequence[dict[str, Any]],
+    *,
+    batch_size: int,
+    is_complete: Callable[[dict[str, Any]], bool],
+) -> list[dict[str, Any]]:
+    """Select the first fixed-order batch containing unfinished work."""
+
+    if batch_size <= 0:
+        raise ValueError("batch size must be positive")
+    selected: list[dict[str, Any]] = []
+    for instance in instances:
+        if not is_complete(instance):
+            selected.append(instance)
+        if len(selected) == batch_size:
+            break
+    return selected
 
 
 def _hash_key(seed: int, *parts: object) -> str:

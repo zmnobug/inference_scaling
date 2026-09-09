@@ -3,6 +3,7 @@ from __future__ import annotations
 from inference_scaling.swebench.selection import (
     STAGE_INSTANCE_COUNTS,
     build_stage_instance_plan,
+    select_incomplete_instance_batch,
     selection_metadata,
 )
 
@@ -48,3 +49,42 @@ def test_selection_metadata_records_repository_counts() -> None:
     assert metadata["name"] == "repo_stratified_v1"
     assert metadata["seed"] == 9
     assert sum(metadata["repo_counts"].values()) == 50
+
+
+def test_incomplete_instance_batch_keeps_fixed_order() -> None:
+    instances = _instances()[:4]
+    complete_ids = {instances[0]["instance_id"], instances[2]["instance_id"]}
+
+    selected = select_incomplete_instance_batch(
+        instances,
+        batch_size=2,
+        is_complete=lambda instance: instance["instance_id"] in complete_ids,
+    )
+
+    assert [instance["instance_id"] for instance in selected] == [
+        instances[1]["instance_id"],
+        instances[3]["instance_id"],
+    ]
+
+
+def test_incomplete_instance_batch_returns_empty_for_complete_matrix() -> None:
+    selected = select_incomplete_instance_batch(
+        _instances()[:2],
+        batch_size=1,
+        is_complete=lambda _instance: True,
+    )
+
+    assert selected == []
+
+
+def test_incomplete_instance_batch_rejects_non_positive_size() -> None:
+    try:
+        select_incomplete_instance_batch(
+            _instances()[:1],
+            batch_size=0,
+            is_complete=lambda _instance: False,
+        )
+    except ValueError as error:
+        assert str(error) == "batch size must be positive"
+    else:
+        raise AssertionError("expected a non-positive batch size to fail")

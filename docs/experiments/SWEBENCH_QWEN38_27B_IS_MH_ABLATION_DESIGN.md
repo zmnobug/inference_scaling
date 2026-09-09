@@ -429,13 +429,27 @@ MiniAgent 官方 text/XML action 协议，不向 API 发送原生 tools。
 ```
 
 预检会验证 Python/依赖、Docker、数据集和一次真实 API logprob 响应。任一 token 缺 logprob 时会在启动正式 Docker
-任务前失败；API 若返回没有对应 logprob 的独立 reasoning 字段也会失败。smoke 通过后按顺序运行成本校准和边界压力：
+任务前失败；API 若返回没有对应 logprob 的独立 reasoning 字段也会失败。smoke 通过后按顺序运行成本校准和边界压力。
+长阶段使用 `--batch-instances` 按完整实例分批；manifest 和 `dataset.parquet` 仍描述完整的预注册矩阵，每批只提交前 N
+个仍有未完成 arm/seed 的实例。同一命令重复执行时会校验并跳过已完成记录，再自动推进到下一批，不需要从外部中断
+runner。建议 calibrate 首批只运行一个实例的全部 13 个 arm：
 
 ```bash
-./run_swebench_stage.sh calibrate configs/swebench_qwen38_27b_api.toml
-./run_swebench_stage.sh stress configs/swebench_qwen38_27b_api.toml
+./run_swebench_stage.sh calibrate configs/swebench_qwen38_27b_api.toml \
+  --batch-instances 1 --workers 1
+```
+
+检查首批成本、IS ESS、MH 接受率和失败分类后，重复上面的命令完成其余四个实例；第五批完成后再执行 calibrate
+evaluator。需要一次运行整个阶段时不传 `--batch-instances`。calibrate 完成后再按相同方式运行两批 stress，全部完成后
+执行 stress evaluator：
+
+```bash
 ./evaluate_swebench_ablation.sh \
   results/swebench/qwen38-27b-is-mh-v3/calibrate --max-workers 4
+./run_swebench_stage.sh stress configs/swebench_qwen38_27b_api.toml \
+  --batch-instances 1 --workers 1
+./run_swebench_stage.sh stress configs/swebench_qwen38_27b_api.toml \
+  --batch-instances 1 --workers 1
 ./evaluate_swebench_ablation.sh \
   results/swebench/qwen38-27b-is-mh-v3/stress --max-workers 4
 ```

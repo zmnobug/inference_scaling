@@ -31,6 +31,7 @@ from inference_scaling.swebench.selection import (
     SELECTION_PLAN_VERSION,
     STAGE_INSTANCE_COUNTS,
     build_stage_instance_plan,
+    select_incomplete_instance_batch,
     selection_metadata,
 )
 
@@ -155,6 +156,15 @@ def main() -> None:
     )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--workers", type=int)
+    parser.add_argument(
+        "--batch-instances",
+        type=int,
+        metavar="N",
+        help=(
+            "run every arm and seed for the first N instances that still have "
+            "incomplete records; repeat the same command to advance"
+        ),
+    )
     parser.add_argument("--seed", action="append", type=int, dest="seeds")
     parser.add_argument("--arm", action="append", default=[])
     parser.add_argument("--output", type=Path)
@@ -162,6 +172,8 @@ def main() -> None:
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.batch_instances is not None and args.batch_instances <= 0:
+        parser.error("--batch-instances must be positive")
 
     experiment = load_experiment_config(args.config)
     if not args.dry_run:
@@ -265,12 +277,48 @@ def main() -> None:
     _write_dataset_snapshot(output_root / "dataset.parquet", instances)
     atomic_write_json(manifest_path, manifest)
 
-    jobs = [
-        (instance, arm, seed)
-        for arm in arms
-        for seed in seeds
-        for instance in instances
-    ]
+    def record_is_complete(
+        instance: dict[str, Any], arm: ExperimentArm, seed: int
+    ) -> bool:
+        if args.redo:
+            return False
+        instance_id = str(instance["instance_id"])
+        record_path = (
+            result_directory(output_root, arm, seed, instance_id) / "record.json"
+        )
+        return existing_record_matches(record_path, experiment, arm, seed, instance)
+
+    if args.batch_instances is None:
+        jobs = [
+            (instance, arm, seed)
+            for arm in arms
+            for seed in seeds
+            for instance in instances
+        ]
+    else:
+        scheduled_instances = select_incomplete_instance_batch(
+            instances,
+            batch_size=args.batch_instances,
+            is_complete=lambda instance: all(
+                record_is_complete(instance, arm, seed)
+                for arm in arms
+                for seed in seeds
+            ),
+        )
+        # Keep every arm and seed for each selected instance together. Completed
+        # records are submitted too, but run_job skips them after revalidating.
+        jobs = [
+            (instance, arm, seed)
+            for instance in scheduled_instances
+            for arm in arms
+            for seed in seeds
+        ]
+    scheduled_instance_ids = list(
+        dict.fromkeys(str(instance["instance_id"]) for instance, _, _ in jobs)
+    )
+    pending_jobs = sum(
+        not record_is_complete(instance, arm, seed) for instance, arm, seed in jobs
+    )
     print(
         json.dumps(
             {
@@ -279,7 +327,11 @@ def main() -> None:
                 "selection": selected_by,
                 "arms": [arm.tag for arm in arms],
                 "seeds": list(seeds),
+                "matrix_jobs": len(instances) * len(arms) * len(seeds),
                 "jobs": len(jobs),
+                "pending_jobs": pending_jobs,
+                "batch_instances": args.batch_instances,
+                "scheduled_instance_ids": scheduled_instance_ids,
                 "workers": workers,
                 "dry_run": args.dry_run,
             },
