@@ -82,6 +82,15 @@ def summarize_results(results: Path) -> dict[str, Any]:
                 "total_snapshot_failures": sum(
                     item.get("snapshot_failures", 0) for item in usages
                 ),
+                "mean_state_restores": _mean(
+                    [item.get("state_restores", 0) for item in usages]
+                ),
+                "total_state_restores": sum(
+                    item.get("state_restores", 0) for item in usages
+                ),
+                "total_restore_failures": sum(
+                    item.get("restore_failures", 0) for item in usages
+                ),
                 "mean_api_seconds": _mean(
                     [item.get("api_seconds", 0.0) for item in usages]
                 ),
@@ -99,6 +108,12 @@ def summarize_results(results: Path) -> dict[str, Any]:
                 ),
                 "total_snapshot_seconds": sum(
                     item.get("snapshot_seconds", 0.0) for item in usages
+                ),
+                "mean_restore_seconds": _mean(
+                    [item.get("restore_seconds", 0.0) for item in usages]
+                ),
+                "total_restore_seconds": sum(
+                    item.get("restore_seconds", 0.0) for item in usages
                 ),
                 "mean_wall_seconds": _mean([item["elapsed_seconds"] for item in usages]),
                 "total_wall_seconds": sum(item["elapsed_seconds"] for item in usages),

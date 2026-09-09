@@ -9,6 +9,7 @@ import math
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
@@ -45,9 +46,12 @@ class UsageSnapshot:
     tool_failures: int
     state_snapshots: int
     snapshot_failures: int
+    state_restores: int
+    restore_failures: int
     api_seconds: float
     tool_seconds: float
     snapshot_seconds: float
+    restore_seconds: float
     elapsed_seconds: float
 
 
@@ -66,9 +70,12 @@ class BudgetLedger:
         self._tool_failures = 0
         self._state_snapshots = 0
         self._snapshot_failures = 0
+        self._state_restores = 0
+        self._restore_failures = 0
         self._api_seconds = 0.0
         self._tool_seconds = 0.0
         self._snapshot_seconds = 0.0
+        self._restore_seconds = 0.0
         self._started = time.monotonic()
         self._lock = threading.Lock()
 
@@ -159,6 +166,14 @@ class BudgetLedger:
             self._snapshot_failures += int(failed)
             self._snapshot_seconds += max(0.0, elapsed_seconds)
 
+    def finish_state_restore(
+        self, elapsed_seconds: float, *, failed: bool
+    ) -> None:
+        with self._lock:
+            self._state_restores += 1
+            self._restore_failures += int(failed)
+            self._restore_seconds += max(0.0, elapsed_seconds)
+
     def check(self) -> None:
         with self._lock:
             self._check_locked()
@@ -176,9 +191,12 @@ class BudgetLedger:
                 tool_failures=self._tool_failures,
                 state_snapshots=self._state_snapshots,
                 snapshot_failures=self._snapshot_failures,
+                state_restores=self._state_restores,
+                restore_failures=self._restore_failures,
                 api_seconds=self._api_seconds,
                 tool_seconds=self._tool_seconds,
                 snapshot_seconds=self._snapshot_seconds,
+                restore_seconds=self._restore_seconds,
                 elapsed_seconds=self._elapsed(),
             )
 
@@ -240,7 +258,7 @@ class BudgetedEnvironment:
     def executable(self) -> str:
         return str(getattr(self.config, "executable", "docker"))
 
-    def snapshot(self) -> str:
+    def snapshot(self, image_ref: str) -> str:
         """Commit an immutable Docker root-filesystem checkpoint."""
 
         container_id = self.container_id
@@ -286,6 +304,7 @@ class BudgetedEnvironment:
                     "--change",
                     "LABEL org.inference-scaling.swebench.checkpoint=true",
                     container_id,
+                    image_ref,
                 ],
                 capture_output=True,
                 text=True,
@@ -774,6 +793,7 @@ class SessionCheckpoint:
     """Agent state plus an immutable Docker root-filesystem image."""
 
     image_id: str
+    image_ref: str
     messages: tuple[dict[str, Any], ...]
     executed: tuple[ExecutedDecision, ...]
     n_calls: int
@@ -786,6 +806,7 @@ class SessionCheckpoint:
     def to_dict(self) -> dict[str, Any]:
         return {
             "image_id": self.image_id,
+            "image_ref": self.image_ref,
             "message_digest": message_digest(self.messages),
             "decision_count": len(self.executed),
             "trajectory_output_tokens": sum(
@@ -1047,9 +1068,12 @@ class MiniAgentSession:
             self.apply_decision(self.sample_decision())
         return self
 
-    def make_checkpoint(self, image_id: str) -> SessionCheckpoint:
+    def make_checkpoint(
+        self, image_id: str, image_ref: str
+    ) -> SessionCheckpoint:
         return SessionCheckpoint(
             image_id=image_id,
+            image_ref=image_ref,
             messages=tuple(copy.deepcopy(self.agent.messages)),
             executed=tuple(copy.deepcopy(self.executed)),
             n_calls=int(self.agent.n_calls),
@@ -1135,7 +1159,9 @@ class MiniAgentSessionFactory:
         self.instance = dict(instance)
         self.ledger = ledger
         self._sessions: list[MiniAgentSession] = []
-        self._snapshot_images: list[tuple[str, str]] = []
+        self._snapshot_namespace = uuid.uuid4().hex
+        self._snapshot_counter = 0
+        self._snapshot_images: list[tuple[str, str, str]] = []
         self.runtime = experiment.api.resolve_runtime(environ)
         self.mini_config = get_config_from_spec(experiment.run.miniagent_config)
         self.mini_config = copy.deepcopy(self.mini_config)
@@ -1214,11 +1240,16 @@ class MiniAgentSessionFactory:
     def checkpoint(self, session: MiniAgentSession) -> SessionCheckpoint:
         if session.closed:
             raise RuntimeError("cannot checkpoint a closed MiniAgent session")
-        image_id = session.environment.snapshot()
-        self._snapshot_images.append(
-            (session.environment.executable, image_id)
+        self._snapshot_counter += 1
+        image_ref = (
+            "inference-scaling-swebench-checkpoint:"
+            f"{self._snapshot_namespace}-{self._snapshot_counter:06d}"
         )
-        return session.make_checkpoint(image_id)
+        image_id = session.environment.snapshot(image_ref)
+        self._snapshot_images.append(
+            (session.environment.executable, image_ref, image_id)
+        )
+        return session.make_checkpoint(image_id, image_ref)
 
     def create_from_checkpoint(
         self,
@@ -1233,19 +1264,45 @@ class MiniAgentSessionFactory:
             raise RuntimeError(
                 "exact IS/MH checkpoint branching currently requires Docker"
             )
-        instance = dict(self.instance)
-        instance["image_name"] = checkpoint.image_id
-        config = copy.deepcopy(self.mini_config)
-        config.setdefault("run", {}).pop("env_startup_command", None)
-        raw_environment = get_sb_environment(config, instance)
-        session = self._create_session(
-            raw_environment, namespace, seed, chunk_tokens
-        )
-        session.restore_checkpoint(
-            checkpoint,
-            restore_model_request_index=restore_model_request_index,
-        )
-        return session
+        started = time.monotonic()
+        failed = True
+        try:
+            executable = str(
+                self.mini_config.get("environment", {}).get(
+                    "executable", "docker"
+                )
+            )
+            inspected = subprocess.run(
+                [executable, "image", "inspect", checkpoint.image_ref],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if inspected.returncode != 0:
+                raise RuntimeError(
+                    "checkpoint image is unavailable before restore: "
+                    f"ref={checkpoint.image_ref} id={checkpoint.image_id}; "
+                    f"docker_error={inspected.stderr.strip()!r}"
+                )
+            instance = dict(self.instance)
+            instance["image_name"] = checkpoint.image_ref
+            config = copy.deepcopy(self.mini_config)
+            config.setdefault("run", {}).pop("env_startup_command", None)
+            raw_environment = get_sb_environment(config, instance)
+            session = self._create_session(
+                raw_environment, namespace, seed, chunk_tokens
+            )
+            session.restore_checkpoint(
+                checkpoint,
+                restore_model_request_index=restore_model_request_index,
+            )
+            failed = False
+            return session
+        finally:
+            self.ledger.finish_state_restore(
+                time.monotonic() - started, failed=failed
+            )
 
     def discard_checkpoints(
         self, checkpoints: Sequence[SessionCheckpoint]
@@ -1254,27 +1311,31 @@ class MiniAgentSessionFactory:
             matches = [
                 item
                 for item in self._snapshot_images
-                if item[1] == checkpoint.image_id
+                if item[1] == checkpoint.image_ref
             ]
             if not matches:
                 continue
-            executable, image_id = matches[-1]
+            executable, image_ref, image_id = matches[-1]
             result = subprocess.run(
-                [executable, "image", "rm", image_id],
+                [executable, "image", "rm", image_ref],
                 capture_output=True,
                 text=True,
                 timeout=60,
                 check=False,
             )
-            if result.returncode == 0:
-                self._snapshot_images.remove((executable, image_id))
+            if result.returncode == 0 or "No such image" in getattr(
+                result, "stderr", ""
+            ):
+                self._snapshot_images.remove(
+                    (executable, image_ref, image_id)
+                )
 
     def close_all(self) -> None:
         for session in self._sessions:
             session.close()
-        for executable, image_id in reversed(self._snapshot_images):
+        for executable, image_ref, _image_id in reversed(self._snapshot_images):
             subprocess.run(
-                [executable, "image", "rm", image_id],
+                [executable, "image", "rm", image_ref],
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -1292,6 +1353,6 @@ def miniagent_manifest(experiment: ExperimentConfig) -> dict[str, Any]:
         "max_trajectory_output_tokens": (
             experiment.agent.max_trajectory_output_tokens
         ),
-        "branch_state_mode": "docker_commit_checkpoint_v1",
+        "branch_state_mode": "docker_tagged_commit_checkpoint_v2",
         "api": _redact(asdict(experiment.api)),
     }

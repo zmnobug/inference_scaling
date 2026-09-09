@@ -35,9 +35,12 @@ def _write_record(
                     "tool_failures": 0,
                     "state_snapshots": 2,
                     "snapshot_failures": 0,
+                    "state_restores": 3,
+                    "restore_failures": 0,
                     "api_seconds": 1.5,
                     "tool_seconds": 2.5,
                     "snapshot_seconds": 0.5,
+                    "restore_seconds": 0.75,
                     "elapsed_seconds": elapsed_seconds,
                 },
             }
@@ -72,8 +75,10 @@ def test_summary_records_natural_resource_totals(tmp_path: Path) -> None:
     assert group["total_api_tokens"] == 442
     assert group["total_tool_calls"] == 6
     assert group["total_state_snapshots"] == 4
+    assert group["total_state_restores"] == 6
     assert group["total_api_failures"] == 2
     assert group["total_api_seconds"] == 3.0
     assert group["total_tool_seconds"] == 5.0
     assert group["total_snapshot_seconds"] == 1.0
+    assert group["total_restore_seconds"] == 1.5
     assert group["total_wall_seconds"] == 12.0

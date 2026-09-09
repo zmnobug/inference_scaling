@@ -12,6 +12,8 @@ from inference_scaling.swebench.miniagent import (
     BudgetLedger,
     _LogprobModelMixin,
     MiniAgentSession,
+    MiniAgentSessionFactory,
+    SessionCheckpoint,
     extract_logprob_metadata,
 )
 
@@ -303,7 +305,8 @@ def test_docker_environment_checkpoint_is_audited(
     ledger = _ledger()
     environment = BudgetedEnvironment(raw, ledger)
 
-    assert environment.snapshot() == "sha256:checkpoint"
+    image_ref = "inference-scaling-swebench-checkpoint:test-000001"
+    assert environment.snapshot(image_ref) == "sha256:checkpoint"
     environment.cleanup()
 
     assert commands[0][:3] == ["docker", "inspect", "--format"]
@@ -311,6 +314,7 @@ def test_docker_environment_checkpoint_is_audited(
     assert (
         "LABEL org.inference-scaling.swebench.checkpoint=true" in commands[1]
     )
+    assert commands[1][-1] == image_ref
     assert commands[2] == ["docker", "rm", "-f", "container-id"]
     usage = ledger.snapshot()
     assert usage.state_snapshots == 1
@@ -338,7 +342,126 @@ def test_docker_environment_checkpoint_rejects_mounts(monkeypatch) -> None:
     environment = BudgetedEnvironment(raw, ledger)
 
     with pytest.raises(RuntimeError, match="without mounts"):
-        environment.snapshot()
+        environment.snapshot(
+            "inference-scaling-swebench-checkpoint:test-000001"
+        )
     usage = ledger.snapshot()
     assert usage.state_snapshots == 1
     assert usage.snapshot_failures == 1
+
+
+def test_checkpoint_restore_rejects_a_missing_tag_and_records_failure(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "inference_scaling.swebench.miniagent.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="Error response from daemon: No such image",
+        ),
+    )
+    factory = MiniAgentSessionFactory.__new__(MiniAgentSessionFactory)
+    factory.experiment = cast(
+        Any, SimpleNamespace(run=SimpleNamespace(environment_class="docker"))
+    )
+    factory.mini_config = {"environment": {"executable": "docker"}}
+    factory.ledger = _ledger()
+    checkpoint = cast(
+        SessionCheckpoint,
+        SimpleNamespace(
+            image_ref="inference-scaling-swebench-checkpoint:test-000001",
+            image_id="sha256:missing",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="unavailable before restore"):
+        factory.create_from_checkpoint(checkpoint, "test", 7, 64)
+
+    usage = factory.ledger.snapshot()
+    assert usage.state_restores == 1
+    assert usage.restore_failures == 1
+
+
+def test_checkpoint_restore_starts_from_the_protected_image_tag(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "inference_scaling.swebench.miniagent.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="[]", stderr=""
+        ),
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_environment(config, instance):
+        captured["config"] = config
+        captured["instance"] = instance
+        return object()
+
+    monkeypatch.setattr(
+        "inference_scaling.swebench.miniagent.get_sb_environment",
+        fake_environment,
+    )
+    restored: list[tuple[SessionCheckpoint, bool]] = []
+    session = SimpleNamespace(
+        restore_checkpoint=lambda checkpoint, restore_model_request_index: (
+            restored.append((checkpoint, restore_model_request_index))
+        )
+    )
+    factory = MiniAgentSessionFactory.__new__(MiniAgentSessionFactory)
+    factory.experiment = cast(
+        Any, SimpleNamespace(run=SimpleNamespace(environment_class="docker"))
+    )
+    factory.instance = {"instance_id": "test"}
+    factory.mini_config = {
+        "environment": {"executable": "docker"},
+        "run": {"env_startup_command": "initialize"},
+    }
+    factory.ledger = _ledger()
+    monkeypatch.setattr(factory, "_create_session", lambda *args: session)
+    checkpoint = cast(
+        SessionCheckpoint,
+        SimpleNamespace(
+            image_ref="inference-scaling-swebench-checkpoint:test-000001",
+            image_id="sha256:checkpoint",
+        ),
+    )
+
+    result = factory.create_from_checkpoint(checkpoint, "test", 7, 64)
+
+    assert result is session
+    assert captured["instance"]["image_name"] == checkpoint.image_ref
+    assert "env_startup_command" not in captured["config"]["run"]
+    assert restored == [(checkpoint, False)]
+    usage = factory.ledger.snapshot()
+    assert usage.state_restores == 1
+    assert usage.restore_failures == 0
+
+
+def test_discard_checkpoint_removes_its_tag_not_the_bare_image_id(
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "inference_scaling.swebench.miniagent.subprocess.run", fake_run
+    )
+    image_ref = "inference-scaling-swebench-checkpoint:test-000001"
+    checkpoint = cast(
+        SessionCheckpoint,
+        SimpleNamespace(image_ref=image_ref, image_id="sha256:checkpoint"),
+    )
+    factory = MiniAgentSessionFactory.__new__(MiniAgentSessionFactory)
+    factory._snapshot_images = [
+        ("docker", image_ref, "sha256:checkpoint")
+    ]
+
+    factory.discard_checkpoints([checkpoint])
+
+    assert commands == [["docker", "image", "rm", image_ref]]
+    assert factory._snapshot_images == []

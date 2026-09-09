@@ -42,7 +42,7 @@ except ImportError as exc:  # pragma: no cover - target preflight reports this
     raise ImportError("mini-swe-agent is required for SWE-bench runs") from exc
 
 
-RESULT_SCHEMA_VERSION = "swebench-is-mh-v3"
+RESULT_SCHEMA_VERSION = "swebench-is-mh-v4"
 
 
 def derive_seed(seed: int, *parts: object) -> int:
@@ -210,7 +210,7 @@ def _run_conditional_is(
         steps.append(
             {
                 "step": step_index,
-                "branch_state_mode": "docker_commit_checkpoint_v1",
+                "branch_state_mode": "docker_tagged_commit_checkpoint_v2",
                 "main_checkpoint": main_checkpoint.to_dict(),
                 "candidate_request_ids": [item.request_id for item in candidates],
                 "candidate_logprobs": [item.logprob for item in candidates],
@@ -343,7 +343,7 @@ def _run_mh_chain(
                 {
                     "update": update_index,
                     "cut": cut,
-                    "branch_state_mode": "docker_commit_checkpoint_v1",
+                    "branch_state_mode": "docker_tagged_commit_checkpoint_v2",
                     "cut_checkpoint": current_checkpoints[cut].to_dict(),
                     "old_trajectory_decisions": len(current.executed),
                     "new_trajectory_decisions": len(proposal.executed),
@@ -389,7 +389,7 @@ def _run_mh_chain(
 
     return current, {
         "chain": chain_index,
-        "branch_state_mode": "docker_commit_checkpoint_v1",
+        "branch_state_mode": "docker_tagged_commit_checkpoint_v2",
         "checkpoint_count": len(current_checkpoints),
         "trace": trace,
         "attempts": len(trace),

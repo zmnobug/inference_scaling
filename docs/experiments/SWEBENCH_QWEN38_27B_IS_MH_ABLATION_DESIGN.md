@@ -96,9 +96,10 @@ IS 的候选 action 在隔离工作区中继续运行 MiniAgent rollout。MH 的
 - 初始仓库镜像、安装步骤和环境变量白名单；
 - 最终 patch 的提取和提交方式。
 
-每个隔离工作区必须从固定基础镜像或当前 action 边界的 immutable Docker checkpoint 创建。checkpoint 前校验容器没有
-mount，因为 `docker commit` 不保存挂载数据；候选不能共享未提交文件、进程、端口或工具缓存。模型 API 可以共享，
-但每个请求必须有唯一的实验 request ID。IS/MH 正式 profile 因而只支持 Docker environment。
+每个隔离工作区必须从固定基础镜像或当前 action 边界的 immutable Docker checkpoint 创建。每个 checkpoint 使用唯一
+临时 image tag，避免被默认的 dangling-image prune 回收；运行期间禁止执行 `docker image prune -a`。checkpoint 前校验
+容器没有 mount，因为 `docker commit` 不保存挂载数据；候选不能共享未提交文件、进程、端口或工具缓存。模型 API 可以
+共享，但每个请求必须有唯一的实验 request ID。IS/MH 正式 profile 因而只支持 Docker environment。
 
 ## 5. IS 方法
 
@@ -237,7 +238,8 @@ $`p(a\mid h)^\alpha`$。
 `agent.max_trajectory_output_tokens` 是每条轨迹的协议性生成上限；`budget.max_input_tokens` 与
 `budget.max_output_tokens` 仍设为 `0`，表示不增加跨候选、跨 rollout 的共享 token 预算。API 请求数、工具调用数和
 墙钟仍保留很高的紧急上限，只用于阻止死循环。每个请求、case 和 arm 都保存 input/output token、API 时间、工具时间
-与 checkpoint 次数/耗时。轨迹上限使用规范化的 MiniAgent 可见 token；计费和成本排序使用原始 output token。
+与 checkpoint 创建/恢复次数、失败数和耗时。轨迹上限使用规范化的 MiniAgent 可见 token；计费和成本排序使用原始
+output token。
 
 IS 的粗略生成成本随 `candidate_count * rollouts_per_candidate` 增长；MH 成本近似为
 
@@ -423,7 +425,7 @@ MiniAgent 官方 text/XML action 协议，不向 API 发送原生 tools。
 ```bash
 ./run_swebench_stage.sh smoke configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v2/smoke --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v3/smoke --max-workers 4
 ```
 
 预检会验证 Python/依赖、Docker、数据集和一次真实 API logprob 响应。任一 token 缺 logprob 时会在启动正式 Docker
@@ -433,9 +435,9 @@ MiniAgent 官方 text/XML action 协议，不向 API 发送原生 tools。
 ./run_swebench_stage.sh calibrate configs/swebench_qwen38_27b_api.toml
 ./run_swebench_stage.sh stress configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v2/calibrate --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v3/calibrate --max-workers 4
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v2/stress --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v3/stress --max-workers 4
 ```
 
 每次 evaluator 完成后会生成 `evaluation_summary.json`。根据 calibrate 的临时建议与 stress 的 ESS、接受率和失败警告，
@@ -445,13 +447,13 @@ MiniAgent 官方 text/XML action 协议，不向 API 发送原生 tools。
 ```bash
 ./run_swebench_stage.sh screen configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v2/screen --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v3/screen --max-workers 4
 ./run_swebench_stage.sh seed_check configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v2/seed_check --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v3/seed_check --max-workers 4
 ./run_swebench_stage.sh confirm configs/swebench_qwen38_27b_api.toml
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v2/confirm --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v3/confirm --max-workers 4
 ```
 
 `run_swebench_50.sh` 是最后一条 `confirm` 命令的兼容快捷入口。任一阶段增加 `--dry-run` 可只查看 arm、实例、seed 和
@@ -462,18 +464,18 @@ case 数；`--workers 2` 可调整并发。直接调用 `run_swebench_ablation.s
 `trajectory.json`；profile 根目录保存本次选中数据行的 `dataset.parquet`，官方 evaluator 直接读取这份固定快照。
 若评测旧 `c104f840...` 诊断结果，评测器会保留原文件并生成 `dataset.evaluation.parquet`，从固定的 5.x revision 补齐
 `image/eval_script/log_parser/eval_type`；`evaluation/dataset_provenance.json` 保存双方 hash 和身份字段校验结果。不同
-dataset revision 或 `v1/v2` tag 的结果不得合并。
+dataset revision 或 `v1/v2/v3` tag 的结果不得合并。
 每个 arm/seed 自动重建 `preds.json`，profile 结束时自动更新 `inference_summary.json`，其中包含 input/output token、
 API 请求、工具调用和各项耗时的总量与均值。官方评测完成后另写 `evaluation_summary.json`，包含 resolved、Wilson 区间、
 失败分类、采样诊断、确定性排名和建议配置字段。跨分支的共享 token 预算只记录不截断；每条轨迹仍遵守
 `agent.max_trajectory_output_tokens` 协议上限，达到上限会记录 `TrajectoryTokenLimitExceeded`。相同配置、数据行、arm 和 seed 的完整结果会自动
 跳过；运行矩阵或数据哈希不同时必须使用新 tag，避免混合结果。
 
-checkpoint 镜像带有 `org.inference-scaling.swebench.checkpoint=true` 标签，正常结束时自动删除。进程被强制终止后，可在
-确认没有同仓库实验运行时清理未被容器引用的残留镜像：
+checkpoint 镜像同时带有唯一临时 image tag 和 `org.inference-scaling.swebench.checkpoint=true` label，正常结束时自动
+删除。进程被强制终止后，可在确认没有同仓库实验运行时清理未被容器引用的残留镜像：
 
 ```bash
-docker image prune -f \
+docker image prune -a -f \
   --filter label=org.inference-scaling.swebench.checkpoint=true
 ```
 
@@ -481,14 +483,14 @@ docker image prune -f \
 
 ```bash
 .venv-swebench/bin/python -m experiments.swebench.summarize \
-  --results results/swebench/qwen38-27b-is-mh-v2/screen
+  --results results/swebench/qwen38-27b-is-mh-v3/screen
 ```
 
 使用固定官方 evaluator 评测某个 profile：
 
 ```bash
 ./evaluate_swebench_ablation.sh \
-  results/swebench/qwen38-27b-is-mh-v2/screen --max-workers 4
+  results/swebench/qwen38-27b-is-mh-v3/screen --max-workers 4
 ```
 
 evaluation 日志写入 profile 目录下的 `evaluation/`。先加 `--dry-run` 可以检查每个 arm/seed 的 evaluator 命令。

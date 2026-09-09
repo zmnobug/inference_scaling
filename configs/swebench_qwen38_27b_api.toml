@@ -2,7 +2,7 @@
 # Secrets and the private endpoint stay in environment variables; see the env example.
 
 [run]
-tag = "qwen38-27b-is-mh-v2"
+tag = "qwen38-27b-is-mh-v3"
 output_root = "results/swebench"
 subset = "verified"
 split = "test"
