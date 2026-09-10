@@ -126,6 +126,8 @@ def main() -> None:
         )
         checks["api"] = {
             "model": experiment.api.model_name,
+            "deployment_id": experiment.api.deployment_id,
+            "runtime_fingerprint": factory.runtime["fingerprint"],
             "sampled_logprob": metadata["sampled_logprob"],
             "logprob_tokens": len(metadata["sampled_token_logprobs"]),
             "input_tokens": metadata["input_tokens"],

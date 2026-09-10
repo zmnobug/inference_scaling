@@ -104,3 +104,56 @@ def test_evaluator_normalizes_report_and_writes_summary(
         (tmp_path / "evaluation_summary.json").read_text(encoding="utf-8")
     )
     assert summary["groups"][0]["resolved_rate"] == 1.0
+
+
+def test_evaluator_dry_run_does_not_write_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write(
+        tmp_path / "manifest.json",
+        {
+            "dataset": {
+                "split": "test",
+                "revision": "dataset-revision",
+                "instance_ids": ["instance"],
+            },
+            "arms": [{"tag": "base"}],
+            "seeds": [7],
+        },
+    )
+    _write(
+        tmp_path / "base" / "seed-7" / "preds.json",
+        {
+            "instance": {
+                "instance_id": "instance",
+                "model_name_or_path": "openai/model",
+                "model_patch": "patch",
+            }
+        },
+    )
+    (tmp_path / "dataset.parquet").write_bytes(b"snapshot")
+    monkeypatch.setattr(
+        evaluate,
+        "prepare_evaluation_dataset",
+        lambda **kwargs: (
+            tmp_path / "dataset.parquet",
+            {"mode": "native_swebench_5_dataset"},
+        ),
+    )
+    monkeypatch.setattr(
+        evaluate.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected evaluator execution")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["evaluate", "--results", str(tmp_path), "--dry-run"],
+    )
+
+    evaluate.main()
+
+    assert not (tmp_path / "evaluation").exists()
+    assert not (tmp_path / "evaluation_summary.json").exists()
