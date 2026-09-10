@@ -42,7 +42,7 @@ except ImportError as exc:  # pragma: no cover - target preflight reports this
     raise ImportError("mini-swe-agent is required for SWE-bench runs") from exc
 
 
-RESULT_SCHEMA_VERSION = "swebench-is-mh-v4"
+RESULT_SCHEMA_VERSION = "swebench-is-mh-v5"
 
 
 def derive_seed(seed: int, *parts: object) -> int:
@@ -117,6 +117,7 @@ def _run_conditional_is(
     main = factory.create("is-main", seed, arm.chunk_tokens)
     steps: list[dict[str, Any]] = []
     step_index = 0
+    active_parent_checkpoint: SessionCheckpoint | None = None
     while main.can_query():
         candidate_model = main.agent.model
         remaining_tokens = (
@@ -208,7 +209,13 @@ def _run_conditional_is(
         for candidate_index, candidate_session in enumerate(candidate_sessions):
             if candidate_index != selected:
                 candidate_session.close()
-        factory.discard_checkpoints(candidate_checkpoints)
+        discardable = list(candidate_checkpoints)
+        if active_parent_checkpoint is not None:
+            discardable.append(active_parent_checkpoint)
+        factory.discard_checkpoints(discardable)
+        # The selected container still references this parent image. It becomes
+        # removable after that container is closed on the next iteration.
+        active_parent_checkpoint = main_checkpoint
         steps.append(
             {
                 "step": step_index,
@@ -454,7 +461,8 @@ def run_experiment_arm(
     factory: MiniAgentSessionFactory | None = None
     session: MiniAgentSession | None = None
     status = "completed"
-    error: dict[str, str] | None = None
+    error: dict[str, Any] | None = None
+    runtime_fingerprint = ""
     diagnostics: dict[str, Any] = {}
     trajectory: dict[str, Any] | None = None
     submission = ""
@@ -463,6 +471,7 @@ def run_experiment_arm(
         factory = MiniAgentSessionFactory(
             experiment, instance, ledger, environ=environ
         )
+        runtime_fingerprint = str(factory.runtime["fingerprint"])
         if arm.method == "base":
             session, diagnostics = _run_base(factory, arm, seed)
         elif arm.method == "is":
@@ -494,7 +503,15 @@ def run_experiment_arm(
             trajectory = session.serialize()
     finally:
         if factory is not None:
-            factory.close_all()
+            cleanup_errors = factory.close_all()
+            if cleanup_errors:
+                if error is None:
+                    error = {
+                        "type": "ResourceCleanupError",
+                        "message": "one or more runtime resources could not be cleaned",
+                    }
+                error["cleanup_errors"] = cleanup_errors
+                status = "error"
 
     usage = asdict(ledger.snapshot())
     return {
@@ -508,6 +525,7 @@ def run_experiment_arm(
         "arm_fingerprint": arm.fingerprint,
         "arm": asdict(arm),
         "config_fingerprint": experiment.fingerprint,
+        "runtime_fingerprint": runtime_fingerprint,
         "model_name_or_path": experiment.api.model_name,
         "exit_status": exit_status,
         "submission": submission,
@@ -537,6 +555,7 @@ def result_fingerprint(record: Mapping[str, Any]) -> str:
         "seed": record.get("seed"),
         "arm_fingerprint": record.get("arm_fingerprint"),
         "config_fingerprint": record.get("config_fingerprint"),
+        "runtime_fingerprint": record.get("runtime_fingerprint"),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

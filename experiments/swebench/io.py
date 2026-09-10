@@ -65,6 +65,8 @@ def existing_record_matches(
     arm: ExperimentArm,
     seed: int,
     instance: Mapping[str, Any],
+    *,
+    runtime_fingerprint: str | None,
 ) -> bool:
     if not path.is_file():
         return False
@@ -77,6 +79,10 @@ def existing_record_matches(
         and record.get("config_fingerprint") == experiment.fingerprint
         and record.get("arm_fingerprint") == arm.fingerprint
         and record.get("instance_fingerprint") == instance_fingerprint(instance)
+        and (
+            runtime_fingerprint is None
+            or record.get("runtime_fingerprint") == runtime_fingerprint
+        )
         and int(record.get("seed", -1)) == seed
         and record.get("status") in {"completed", "budget_exceeded"}
     )
@@ -116,6 +122,7 @@ def build_manifest(
     seeds: Sequence[int],
     instances: Sequence[Mapping[str, Any]],
     dataset_name: str,
+    runtime_fingerprint: str | None,
 ) -> dict[str, Any]:
     instance_ids = [str(instance["instance_id"]) for instance in instances]
     instance_fingerprints = [instance_fingerprint(instance) for instance in instances]
@@ -149,6 +156,8 @@ def build_manifest(
         },
         "model": {
             "request_name": experiment.api.model_name,
+            "deployment_id": experiment.api.deployment_id,
+            "runtime_fingerprint": runtime_fingerprint,
             "base_url_env": experiment.api.base_url_env,
             "api_key_env": experiment.api.api_key_env,
             "seed_supported": experiment.api.seed_supported,

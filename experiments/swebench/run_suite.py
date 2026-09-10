@@ -164,8 +164,11 @@ def main() -> None:
         parser.error("--batch-instances must be positive")
 
     experiment = load_experiment_config(args.config)
+    runtime_fingerprint: str | None = None
     if not args.dry_run:
-        experiment.api.resolve_runtime()
+        runtime_fingerprint = str(
+            experiment.api.resolve_runtime()["fingerprint"]
+        )
     arms = _select_arms(experiment.arms, args.arm)
     if any(arm.method in {"is", "mh"} for arm in arms) and (
         experiment.run.environment_class != "docker"
@@ -204,19 +207,19 @@ def main() -> None:
         seeds=seeds,
         instances=instances,
         dataset_name=resolve_dataset_name(experiment.run.subset),
+        runtime_fingerprint=runtime_fingerprint,
     )
     manifest_path = output_root / "manifest.json"
     if manifest_path.exists() and not args.redo:
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        comparable_keys = ("config_fingerprint", "dataset", "arms", "seeds")
+        comparable_keys = ["config_fingerprint", "dataset", "arms", "seeds"]
+        if runtime_fingerprint is not None:
+            comparable_keys.append("model")
         if any(previous.get(key) != manifest.get(key) for key in comparable_keys):
             raise RuntimeError(
                 f"existing manifest at {manifest_path} uses a different run matrix; "
                 "choose a new tag or output directory"
             )
-    _write_dataset_snapshot(output_root / "dataset.parquet", instances)
-    atomic_write_json(manifest_path, manifest)
-
     def record_is_complete(
         instance: dict[str, Any], arm: ExperimentArm, seed: int
     ) -> bool:
@@ -226,7 +229,14 @@ def main() -> None:
         record_path = (
             result_directory(output_root, arm, seed, instance_id) / "record.json"
         )
-        return existing_record_matches(record_path, experiment, arm, seed, instance)
+        return existing_record_matches(
+            record_path,
+            experiment,
+            arm,
+            seed,
+            instance,
+            runtime_fingerprint=runtime_fingerprint,
+        )
 
     if args.batch_instances is None:
         jobs = [
@@ -278,6 +288,9 @@ def main() -> None:
     if args.dry_run:
         return
 
+    _write_dataset_snapshot(output_root / "dataset.parquet", instances)
+    atomic_write_json(manifest_path, manifest)
+
     from inference_scaling.swebench.runner import run_experiment_arm
 
     print_lock = threading.Lock()
@@ -288,7 +301,12 @@ def main() -> None:
         directory = result_directory(output_root, arm, seed, instance_id)
         record_path = directory / "record.json"
         if not args.redo and existing_record_matches(
-            record_path, experiment, arm, seed, instance
+            record_path,
+            experiment,
+            arm,
+            seed,
+            instance,
+            runtime_fingerprint=runtime_fingerprint,
         ):
             return {
                 "status": "skipped",

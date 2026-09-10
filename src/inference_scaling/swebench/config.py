@@ -72,6 +72,7 @@ class RunConfig:
 @dataclass(frozen=True, slots=True)
 class APIConfig:
     model_name: str
+    deployment_id: str
     base_url_env: str
     api_key_env: str
     temperature: float
@@ -85,6 +86,8 @@ class APIConfig:
     def __post_init__(self) -> None:
         if not self.model_name.strip():
             raise ValueError("api.model_name must not be empty")
+        if not self.deployment_id.strip():
+            raise ValueError("api.deployment_id must not be empty")
         if not self.base_url_env.strip() or not self.api_key_env.strip():
             raise ValueError("api base URL and key environment names must not be empty")
         if self.temperature != 1.0 or self.top_p != 1.0:
@@ -124,7 +127,18 @@ class APIConfig:
                         f"{self.extra_headers_env} must contain a JSON string map"
                     )
                 headers = loaded
-        return {"base_url": base_url, "api_key": api_key, "extra_headers": headers}
+        identity = {
+            "base_url": base_url.rstrip("/"),
+            "deployment_id": self.deployment_id,
+            "model_name": self.model_name,
+        }
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        return {
+            "base_url": base_url,
+            "api_key": api_key,
+            "extra_headers": headers,
+            "fingerprint": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,8 +158,11 @@ class AgentConfig:
             "agent.max_trajectory_output_tokens",
             self.max_trajectory_output_tokens,
         )
-        if self.action_mode not in {"text", "tool"}:
-            raise ValueError("agent.action_mode must be text or tool")
+        if self.action_mode != "text":
+            raise ValueError(
+                "agent.action_mode must be text; structured tool-call logprobs "
+                "are not supported"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +379,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         ),
         api=APIConfig(
             model_name=str(api["model_name"]),
+            deployment_id=str(api.get("deployment_id", "")),
             base_url_env=str(api.get("base_url_env", "OPENAI_API_BASE")),
             api_key_env=str(api.get("api_key_env", "OPENAI_API_KEY")),
             temperature=float(api.get("temperature", 1.0)),

@@ -75,7 +75,6 @@ def main() -> None:
     allowed_arms = set(args.arm)
     allowed_seeds = set(args.seeds or manifest["seeds"])
     evaluation_root = args.results / "evaluation"
-    evaluation_root.mkdir(parents=True, exist_ok=True)
     if not snapshot.is_file():
         raise FileNotFoundError(
             f"inference dataset snapshot is required for evaluation: {snapshot}"
@@ -86,10 +85,12 @@ def main() -> None:
         expected_instance_ids=expected_instance_ids,
     )
     dataset_name = str(evaluation_snapshot.resolve())
-    atomic_write_json(
-        evaluation_root / "dataset_provenance.json",
-        dataset_provenance,
-    )
+    if not args.dry_run:
+        evaluation_root.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            evaluation_root / "dataset_provenance.json",
+            dataset_provenance,
+        )
 
     jobs = []
     for arm in manifest["arms"]:
