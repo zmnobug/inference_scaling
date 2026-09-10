@@ -1,0 +1,63 @@
+[run]
+name = "omnimath-qwen38-27b-is-chunk-ratio-v1"
+seed = 20260910
+dataset_seed = 20260910
+bootstrap_replicates = 10000
+
+[models]
+# Override with --model when the server uses a local checkpoint path.
+base = "Qwen/Qwen3.8-27B"
+base_source = "Qwen/Qwen3.8-27B"
+base_revision = "record-the-deployed-checkpoint-revision"
+
+[runtime]
+backend = "vllm-sync"
+device = "cuda"
+dtype = "bfloat16"
+max_score_batch_size = 8
+
+[vllm]
+dtype = "bfloat16"
+tensor_parallel_size = 4
+data_parallel_size = 1
+enable_prefix_caching = true
+gpu_memory_utilization = 0.90
+max_model_len = 16384
+max_num_seqs = 16
+max_num_batched_tokens = 16384
+
+[vllm.engine_kwargs]
+enable_chunked_prefill = true
+
+[prompt]
+enable_thinking = true
+reasoning_effort = "medium"
+
+[generation]
+max_new_tokens = 1024
+
+[sampling]
+temperature = 1.0
+top_p = 1.0
+
+[conditional_is]
+candidate_count = 4
+rollout_count = 2
+rollout_design = "iid"
+reward = "sequence_log_probability"
+logprob_reward_scale = 1.0
+reward_temperature = 10.0
+apply_importance_correction = true
+exact_rollout_early_stop = false
+rollout_evaluation_batch_size = 8
+chunk_alignment_tokens = 8
+chunk_ratios = [0.125, 0.25, 0.5, 1.0]
+
+[partitions]
+probe_per_bucket = 2
+screen_per_bucket = 3
+confirm_per_bucket = 2
+
+[preflight]
+generated_tokens = 2
+logprob_absolute_tolerance = 0.0001

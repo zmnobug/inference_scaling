@@ -16,6 +16,7 @@ from inference_scaling.experimental.shared.rqmc import (
     scrambled_sobol_uniforms,
 )
 from inference_scaling.arllm.types import ScoreRequest
+from inference_scaling.arllm.types import SequenceSample
 
 
 def _backend() -> TabularAutoregressiveBackend:
@@ -248,6 +249,76 @@ def test_conditional_is_never_exceeds_total_length() -> None:
     )
     assert len(result.token_ids) == 5
     assert [len(step.selected.token_ids) for step in result.steps] == [2, 2, 1]
+
+
+def test_early_eos_first_candidate_does_not_inflate_other_rollout_budget() -> None:
+    class MixedLengthBackend:
+        model_id = "mixed-length"
+
+        def __init__(self):
+            self.calls = []
+
+        def sample_batch(self, requests):
+            self.calls.append(tuple(requests))
+            if len(self.calls) == 1:
+                policy = requests[0].sampling.policy_id
+                return [
+                    SequenceSample(
+                        requests[0].prefix,
+                        (2,),
+                        (-0.1,),
+                        policy,
+                        self.model_id,
+                        requests[0].request_id,
+                        "eos",
+                    ),
+                    SequenceSample(
+                        requests[1].prefix,
+                        (1, 1),
+                        (-0.2, -0.2),
+                        policy,
+                        self.model_id,
+                        requests[1].request_id,
+                    ),
+                ]
+            return [
+                SequenceSample(
+                    request.prefix,
+                    (1,) * request.max_new_tokens,
+                    (-0.2,) * request.max_new_tokens,
+                    request.sampling.policy_id,
+                    self.model_id,
+                    request.request_id,
+                )
+                for request in requests
+            ]
+
+        def score_batch(self, requests):
+            return [(-0.2,) * len(tokens) for request in requests for tokens in request.continuations]
+
+    backend = MixedLengthBackend()
+    step = conditional_is_step(
+        base_backend=backend,
+        rollout_backend=backend,
+        prompt=(),
+        generated_prefix=(),
+        config=ConditionalISConfig(
+            candidate_count=2,
+            rollout_count=1,
+            block_size=2,
+            total_length=4,
+        ),
+        base_sampling=SamplingConfig(eos_token_id=2),
+        rollout_sampling=SamplingConfig(eos_token_id=2),
+        reward=lambda _prompt, generated: float(len(generated)),
+        seeds=SeedStream(29),
+        step_index=0,
+    )
+
+    assert [request.max_new_tokens for request in backend.calls[1]] == [2]
+    assert len(step.candidates[1].token_ids) + len(
+        step.candidates[1].rollouts[0].token_ids
+    ) == 4
 
 
 @pytest.mark.parametrize(

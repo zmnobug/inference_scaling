@@ -1,0 +1,48 @@
+[run]
+name = "omnimath-qwen3-8b-local-smoke"
+seed = 20260910
+dataset_seed = 20260910
+bootstrap_replicates = 1000
+
+[models]
+base = "/data/users/jenkins/qwen3-models/Qwen3-8B"
+base_source = "Qwen/Qwen3-8B"
+base_revision = "local-smoke-only"
+
+[runtime]
+backend = "transformers"
+device = "cuda:0"
+dtype = "float16"
+max_score_batch_size = 2
+
+[prompt]
+enable_thinking = true
+
+[generation]
+max_new_tokens = 32
+
+[sampling]
+temperature = 1.0
+top_p = 1.0
+
+[conditional_is]
+candidate_count = 2
+rollout_count = 1
+rollout_design = "iid"
+reward = "sequence_log_probability"
+logprob_reward_scale = 1.0
+reward_temperature = 10.0
+apply_importance_correction = true
+exact_rollout_early_stop = false
+rollout_evaluation_batch_size = 2
+chunk_alignment_tokens = 8
+chunk_ratios = [0.5, 1.0]
+
+[partitions]
+probe_per_bucket = 2
+screen_per_bucket = 3
+confirm_per_bucket = 2
+
+[preflight]
+generated_tokens = 2
+logprob_absolute_tolerance = 0.0001

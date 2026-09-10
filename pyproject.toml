@@ -44,6 +44,12 @@ training = [
   "pyarrow==25.0.0",
   "trl==1.9.2",
 ]
+omnimath = [
+  "antlr4-python3-runtime==4.11.1",
+  "regex>=2024.11,<2027",
+  "sympy>=1.12,<1.14",
+  "word2number==1.1",
+]
 dllm-training = [
   "peft==0.20.0",
 ]

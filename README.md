@@ -144,6 +144,7 @@ Qwen2.5-1.5B-Instruct 默认对完整生成计算该分数。具有显式推理�
 | --- | --- |
 | [算法基础、原理与实现](docs/methods/ALGORITHMS.md) | 默认 Qwen MH/IS 完整流程、数学目标、模型职责、参数、关键代码、直观收敛说明、执行优化和 vLLM 配置 |
 | [运行与评测](docs/experiments/GSM8K_EXPERIMENT_DESIGN.md) | 数据配置、方法标识、训练与推理命令、统计量和输出目录 |
+| [Omni-MATH Qwen3.8-27B IS chunk ratio 消融设计](docs/experiments/OMNIMATH_QWEN38_27B_IS_CHUNK_RATIO_ABLATION_DESIGN.md) | 高难规则评测子集、完整序列 logprob 目标、比例化 chunk、快速筛选与盲确认协议 |
 | [SWE-bench Qwen3.8-27B API IS/MH 消融设计](docs/experiments/SWEBENCH_QWEN38_27B_IS_MH_ABLATION_DESIGN.md) | 原版 MiniAgent 接入边界、logprob 目标、IS/MH 参数、分阶段消融和审计要求 |
 | [SWE-bench 消融问题与修复记录](docs/experiments/SWEBENCH_QWEN38_27B_IS_MH_INCIDENT_LOG.md) | API、Docker、runner 和 evaluator 故障的证据、根因、修复与结果有效性边界 |
 | [算法设计与准确率](docs/reports/GSM8K_3090_ALIGNED_RESULTS.md) | 固定实验设置下的准确率、pass@k、奖励与 proposal 对照，以及结果适用范围 |
