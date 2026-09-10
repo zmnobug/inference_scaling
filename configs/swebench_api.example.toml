@@ -1,0 +1,67 @@
+# OpenAI-compatible API + official mini-SWE-agent SWE-bench example.
+# Copy this file, set the API environment variables, and choose explicit arms.
+
+[run]
+tag = "swebench-api"
+output_root = "results/swebench"
+subset = "verified"
+split = "test"
+# Pinned SWE-bench 5.x dataset snapshot with evaluator metadata.
+dataset_revision = "78f471bf655a3137b2e8a75af1501690ec009ec3"
+workers = 1
+seeds = [0]
+miniagent_commit = "25941c89cfbc91eb40b3f8756348c91d9977d57e"
+miniagent_config = "swebench_xml.yaml"
+environment_class = "docker"
+instance_filter = ""
+instance_slice = "0:1"
+
+[api]
+# LiteLLM uses the OpenAI provider prefix for OpenAI-compatible endpoints.
+model_name = "openai/model-name"
+base_url_env = "OPENAI_API_BASE"
+api_key_env = "OPENAI_API_KEY"
+extra_headers_env = "OPENAI_API_EXTRA_HEADERS"
+temperature = 1.0
+top_p = 1.0
+timeout_seconds = 300
+max_retries = 3
+seed_supported = true
+# visible_tokens is a log-probability reward tilt. Use power_target_exact only
+# when the endpoint scores all generated tokens, including termination.
+logprob_mode = "visible_tokens"
+
+[agent]
+action_mode = "text"
+step_limit = 100
+cost_limit = 0
+wall_time_limit_seconds = 7200
+max_trajectory_output_tokens = 8192
+
+[budget]
+# Token limits may be disabled with 0; observed usage is still recorded.
+max_api_requests = 10000
+max_input_tokens = 0
+max_output_tokens = 0
+max_tool_calls = 20000
+max_wall_seconds = 86400
+
+[[arms]]
+method = "base"
+chunk_tokens = 819
+
+[[arms]]
+method = "is"
+alpha = 1.5
+candidate_count = 2
+chunk_tokens = 819
+rollout_count = 1
+
+[[arms]]
+method = "mh"
+alpha = 1.5
+updates_per_chain = 1
+max_suffix_actions = "all"
+suffix_schedule = "full"
+chains = 1
+chunk_tokens = 819
