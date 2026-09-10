@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from types import SimpleNamespace
 from typing import Any, cast
@@ -445,3 +446,78 @@ def test_discard_checkpoint_removes_its_tag_not_the_bare_image_id(
 
     assert commands == [["docker", "image", "rm", image_ref]]
     assert factory._snapshot_images == []
+
+
+def test_factory_applies_configured_retry_count(monkeypatch) -> None:
+    monkeypatch.setenv("MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT", "99")
+    monkeypatch.setattr(
+        "inference_scaling.swebench.miniagent.get_config_from_spec",
+        lambda *args: {"agent": {}},
+    )
+    experiment = SimpleNamespace(
+        api=SimpleNamespace(
+            max_retries=2,
+            resolve_runtime=lambda environ: {
+                "base_url": "http://model/v1",
+                "api_key": "secret",
+                "extra_headers": {},
+                "fingerprint": "runtime",
+            },
+        ),
+        run=SimpleNamespace(
+            miniagent_config="swebench_xml.yaml", environment_class="docker"
+        ),
+        agent=SimpleNamespace(
+            step_limit=20,
+            cost_limit=0,
+            wall_time_limit_seconds=60,
+        ),
+    )
+
+    MiniAgentSessionFactory(
+        cast(Any, experiment), {"instance_id": "instance"}, _ledger(), environ={}
+    )
+
+    assert os.environ["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] == "3"
+
+
+def test_close_all_reports_cleanup_failures_and_continues(monkeypatch) -> None:
+    class FailingSession:
+        environment = SimpleNamespace(container_id="container")
+
+        def close(self) -> None:
+            raise RuntimeError("container cleanup failed")
+
+    monkeypatch.setattr(
+        "inference_scaling.swebench.miniagent.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="image is still in use"
+        ),
+    )
+    factory = MiniAgentSessionFactory.__new__(MiniAgentSessionFactory)
+    factory._sessions = [FailingSession()]
+    factory._snapshot_images = [("docker", "checkpoint:test", "sha256:test")]
+
+    errors = factory.close_all()
+
+    assert [error["resource"] for error in errors] == [
+        "container",
+        "checkpoint_image",
+    ]
+    assert factory._sessions == []
+    assert factory._snapshot_images == []
+
+
+def test_session_is_marked_closed_when_cleanup_fails() -> None:
+    class FailingEnvironment:
+        def cleanup(self) -> None:
+            raise RuntimeError("cleanup failed")
+
+    session = MiniAgentSession.__new__(MiniAgentSession)
+    session.environment = cast(Any, FailingEnvironment())
+    session.closed = False
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        session.close()
+
+    assert session.closed is True

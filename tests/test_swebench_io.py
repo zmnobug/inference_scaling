@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
-from experiments.swebench.io import rebuild_predictions
-from inference_scaling.swebench.config import ExperimentArm
+from experiments.swebench.io import existing_record_matches, rebuild_predictions
+from inference_scaling.swebench.config import (
+    ExperimentArm,
+    ExperimentConfig,
+    instance_fingerprint,
+)
+from inference_scaling.swebench.runner import RESULT_SCHEMA_VERSION
 
 
 def _record(path: Path, instance_id: str) -> None:
@@ -33,3 +40,41 @@ def test_rebuild_predictions_excludes_records_outside_current_manifest(
 
     predictions = json.loads((seed_root / "preds.json").read_text(encoding="utf-8"))
     assert set(predictions) == {"current"}
+
+
+def test_resume_requires_matching_runtime_fingerprint(tmp_path: Path) -> None:
+    instance = {"instance_id": "instance", "problem_statement": "problem"}
+    arm = ExperimentArm(method="base", alpha=1.0, chunk_tokens=256)
+    experiment = cast(ExperimentConfig, SimpleNamespace(fingerprint="config"))
+    path = tmp_path / "record.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "config_fingerprint": "config",
+                "arm_fingerprint": arm.fingerprint,
+                "instance_fingerprint": instance_fingerprint(instance),
+                "runtime_fingerprint": "runtime-a",
+                "seed": 7,
+                "status": "completed",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert existing_record_matches(
+        path,
+        experiment,
+        arm,
+        7,
+        instance,
+        runtime_fingerprint="runtime-a",
+    )
+    assert not existing_record_matches(
+        path,
+        experiment,
+        arm,
+        7,
+        instance,
+        runtime_fingerprint="runtime-b",
+    )

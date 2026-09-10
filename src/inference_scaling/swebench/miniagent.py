@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import subprocess
 import threading
 import time
@@ -20,7 +21,6 @@ try:
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.config import get_config_from_spec
     from minisweagent.exceptions import FormatError, InterruptAgentFlow
-    from minisweagent.models.litellm_model import LitellmModel
     from minisweagent.models.litellm_textbased_model import LitellmTextbasedModel
     from minisweagent.run.benchmarks.swebench import get_sb_environment
 except ImportError as exc:  # pragma: no cover - exercised by target-machine preflight
@@ -462,7 +462,7 @@ def extract_logprob_metadata(
     if not entries:
         raise ValueError(
             "API response does not contain sampled-token logprobs; use the official "
-            "MiniAgent text/XML config or enable tool-call argument logprobs server-side"
+            "MiniAgent text/XML config"
         )
 
     tokens: list[str] = []
@@ -709,10 +709,6 @@ class _LogprobModelMixin:
 
 class LogprobLitellmTextbasedModel(_LogprobModelMixin, LitellmTextbasedModel):
     """Official MiniAgent text model with strict sampled-token logprobs."""
-
-
-class LogprobLitellmToolModel(_LogprobModelMixin, LitellmModel):
-    """Official tool model; requires API logprobs covering the emitted content."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1136,8 +1132,10 @@ class MiniAgentSession:
 
     def close(self) -> None:
         if not self.closed:
-            self.environment.cleanup()
-            self.closed = True
+            try:
+                self.environment.cleanup()
+            finally:
+                self.closed = True
 
 
 class MiniAgentSessionFactory:
@@ -1162,6 +1160,11 @@ class MiniAgentSessionFactory:
         self._snapshot_namespace = uuid.uuid4().hex
         self._snapshot_counter = 0
         self._snapshot_images: list[tuple[str, str, str]] = []
+        # Pinned MiniAgent exposes this setting only through the process
+        # environment. All factories in one suite share the same API config.
+        os.environ["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] = str(
+            experiment.api.max_retries + 1
+        )
         self.runtime = experiment.api.resolve_runtime(environ)
         self.mini_config = get_config_from_spec(experiment.run.miniagent_config)
         self.mini_config = copy.deepcopy(self.mini_config)
@@ -1195,12 +1198,7 @@ class MiniAgentSessionFactory:
         )
         if self.runtime["extra_headers"]:
             kwargs["extra_headers"] = self.runtime["extra_headers"]
-        model_class = (
-            LogprobLitellmTextbasedModel
-            if self.experiment.agent.action_mode == "text"
-            else LogprobLitellmToolModel
-        )
-        return model_class(
+        return LogprobLitellmTextbasedModel(
             ledger=self.ledger,
             base_seed=seed,
             request_namespace=namespace,
@@ -1228,6 +1226,7 @@ class MiniAgentSessionFactory:
                 self.experiment.agent.max_trajectory_output_tokens
             ),
         )
+        self._sessions = [item for item in self._sessions if not item.closed]
         self._sessions.append(session)
         return session
 
@@ -1330,18 +1329,55 @@ class MiniAgentSessionFactory:
                     (executable, image_ref, image_id)
                 )
 
-    def close_all(self) -> None:
-        for session in self._sessions:
-            session.close()
+    def close_all(self) -> list[dict[str, str]]:
+        errors: list[dict[str, str]] = []
+        for session in tuple(self._sessions):
+            try:
+                session.close()
+            except Exception as exc:
+                environment = getattr(session, "environment", None)
+                errors.append(
+                    {
+                        "resource": "container",
+                        "identifier": (
+                            getattr(environment, "container_id", None) or "unknown"
+                        ),
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                )
+        self._sessions.clear()
         for executable, image_ref, _image_id in reversed(self._snapshot_images):
-            subprocess.run(
-                [executable, "image", "rm", image_ref],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
+            try:
+                result = subprocess.run(
+                    [executable, "image", "rm", image_ref],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                stderr = getattr(result, "stderr", "") or ""
+                stdout = getattr(result, "stdout", "") or ""
+                if result.returncode != 0 and "No such image" not in stderr:
+                    errors.append(
+                        {
+                            "resource": "checkpoint_image",
+                            "identifier": image_ref,
+                            "type": "DockerCleanupError",
+                            "message": stderr.strip() or stdout.strip(),
+                        }
+                    )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "resource": "checkpoint_image",
+                        "identifier": image_ref,
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                )
         self._snapshot_images.clear()
+        return errors
 
 
 def miniagent_manifest(experiment: ExperimentConfig) -> dict[str, Any]:
