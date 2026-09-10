@@ -25,6 +25,7 @@ environment_class = "docker"
 
 [api]
 model_name = "openai/model"
+deployment_id = "test-deployment-v1"
 temperature = 1.0
 top_p = 1.0
 
@@ -110,6 +111,38 @@ def test_api_runtime_requires_environment_secrets(tmp_path: Path) -> None:
     )
     assert runtime["base_url"] == "http://model/v1"
     assert runtime["api_key"] == "secret"
+
+
+def test_runtime_fingerprint_tracks_endpoint_but_not_api_key(tmp_path: Path) -> None:
+    config = load_experiment_config(_write_config(tmp_path))
+    first = config.api.resolve_runtime(
+        {"OPENAI_API_BASE": "http://model/v1/", "OPENAI_API_KEY": "first"}
+    )
+    same = config.api.resolve_runtime(
+        {"OPENAI_API_BASE": "http://model/v1", "OPENAI_API_KEY": "second"}
+    )
+    different = config.api.resolve_runtime(
+        {"OPENAI_API_BASE": "http://other/v1", "OPENAI_API_KEY": "first"}
+    )
+
+    assert first["fingerprint"] == same["fingerprint"]
+    assert first["fingerprint"] != different["fingerprint"]
+
+
+def test_rejects_missing_deployment_identity(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path, CONFIG.replace('deployment_id = "test-deployment-v1"\n', "")
+    )
+    with pytest.raises(ValueError, match="deployment_id"):
+        load_experiment_config(path)
+
+
+def test_rejects_structured_tool_action_mode(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path, CONFIG.replace('action_mode = "text"', 'action_mode = "tool"')
+    )
+    with pytest.raises(ValueError, match="structured tool-call logprobs"):
+        load_experiment_config(path)
 
 
 def test_rejects_unpinned_dataset(tmp_path: Path) -> None:

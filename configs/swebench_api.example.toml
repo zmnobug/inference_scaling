@@ -19,12 +19,16 @@ instance_slice = "0:1"
 [api]
 # LiteLLM uses the OpenAI provider prefix for OpenAI-compatible endpoints.
 model_name = "openai/model-name"
+# Change this whenever model weights, chat template, serving flags, or proxy
+# normalization behavior changes. Resumable runs require an exact match.
+deployment_id = "model-name-serving-config-v1"
 base_url_env = "OPENAI_API_BASE"
 api_key_env = "OPENAI_API_KEY"
 extra_headers_env = "OPENAI_API_EXTRA_HEADERS"
 temperature = 1.0
 top_p = 1.0
 timeout_seconds = 300
+# Additional attempts after the first request.
 max_retries = 3
 seed_supported = true
 # visible_tokens is a log-probability reward tilt. Use power_target_exact only
