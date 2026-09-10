@@ -163,6 +163,9 @@ class TabularAutoregressiveBackend:
                 if request.sampling.eos_token_id == token:
                     finish_reason = "eos"
                     break
+                if token in request.stop_token_ids:
+                    finish_reason = "stop"
+                    break
             outputs.append(
                 SequenceSample(
                     prefix=request.prefix,
@@ -172,6 +175,9 @@ class TabularAutoregressiveBackend:
                     model_id=self.model_id,
                     request_id=request.request_id,
                     finish_reason=finish_reason,
+                    termination_token_id=(
+                        tokens[-1] if finish_reason in {"eos", "stop"} else None
+                    ),
                 )
             )
         return outputs

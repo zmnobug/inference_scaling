@@ -50,6 +50,11 @@ omnimath = [
   "sympy>=1.12,<1.14",
   "word2number==1.1",
 ]
+livecodebench = [
+  "datasets>=3.2,<5",
+  "pandas>=2,<4",
+  "tqdm>=4.66,<5",
+]
 dllm-training = [
   "peft==0.20.0",
 ]

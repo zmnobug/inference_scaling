@@ -98,3 +98,24 @@ def test_chunked_rollout_preserves_explicit_uniform_stream() -> None:
 
     assert len(result) == 1
     assert result[0].token_ids == (0, 1, 0)
+
+
+def test_chunked_rollout_preserves_extra_stop_tokens() -> None:
+    backend = TabularAutoregressiveBackend(
+        {}, fallback=(0.0, 1.0, 0.0), model_id="base"
+    )
+    broker = AsyncRolloutBroker(backend, chunk_tokens=1)
+    request = GenerationRequest(
+        (),
+        4,
+        SamplingConfig(eos_token_id=2),
+        77,
+        "reasoning-end",
+        stop_token_ids=(1,),
+    )
+
+    sample = broker.run_until([request]).completed[0]
+
+    assert sample.token_ids == (1,)
+    assert sample.finish_reason == "stop"
+    assert sample.termination_token_id == 1

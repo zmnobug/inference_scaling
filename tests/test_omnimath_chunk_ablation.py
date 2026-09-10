@@ -5,10 +5,12 @@ import json
 import pytest
 
 from experiments.arllm.omnimath_chunk_ablation import (
+    _reasoning_boundary,
     build_confirm_decision,
     build_summary,
     chunk_arm,
     chunk_tokens,
+    comparison_chunk_arm,
     parse_ratios,
 )
 from inference_scaling.shared.evaluation.omnimath import (
@@ -31,6 +33,8 @@ def test_chunk_ratio_rounds_up_and_has_stable_arm_labels() -> None:
     assert chunk_tokens(100, 0.125, 8) == 16
     assert chunk_arm(0.125) == "is-cr0125"
     assert chunk_arm(1.0) == "is-cr1000"
+    assert comparison_chunk_arm("full", 0.25) == "full-is-cr0250"
+    assert comparison_chunk_arm("think", 0.25) == "think-is-cr0250"
     assert parse_ratios("0.125,0.25,1") == (0.125, 0.25, 1.0)
     with pytest.raises(ValueError, match="unique"):
         parse_ratios("0.5,0.5")
@@ -102,6 +106,31 @@ def test_probe_gate_matches_preregistered_branches() -> None:
     assert difficulty_band_from_probe(8) == (9.0, 10.0)
 
 
+def test_reasoning_boundary_rejects_a_prompt_without_thinking_mode() -> None:
+    class Tokenizer:
+        eos_token_id = 9
+
+    class Backend:
+        tokenizer = Tokenizer()
+
+        @staticmethod
+        def encode(text, add_special_tokens=False):
+            del add_special_tokens
+            return {"<think>": (1,), "</think>": (2,)}[text]
+
+    config = {
+        "generation": {"max_new_tokens": 1024},
+        "reasoning": {
+            "enabled": True,
+            "start_text": "<think>",
+            "end_text": "</think>",
+        },
+    }
+
+    with pytest.raises(ValueError, match="does not contain reasoning start"):
+        _reasoning_boundary(Backend(), (7, 8), config)
+
+
 def _record(arm, problem_index, correct, slots, seconds, ess=None):
     diagnostics = {}
     if ess is not None:
@@ -146,6 +175,35 @@ def test_screen_summary_uses_quality_then_natural_compute_for_top_two() -> None:
 
     assert summary["recommended_top2"] == ["is-cr0500", "is-cr0250"]
     assert summary["paired_accuracy"]["is-cr0250_minus_base"]["difference"] == 0.5
+
+
+def test_comparison_screen_selects_top_two_inside_each_is_family() -> None:
+    arms = [
+        "base",
+        "full-is-cr0125",
+        "full-is-cr0250",
+        "think-is-cr0125",
+        "think-is-cr0250",
+    ]
+    records = [
+        _record(arm, problem, arm.endswith("0250"), 10, 1.0, 0.8)
+        for arm in arms
+        for problem in range(2)
+    ]
+    manifest = {
+        "fingerprint": "comparison",
+        "phase": "screen",
+        "seed": 11,
+        "arms": arms,
+    }
+
+    summary = build_summary(records, manifest, bootstrap_replicates=100)
+
+    assert summary["recommended_top2"] is None
+    assert summary["recommended_top2_by_family"] == {
+        "full": ["full-is-cr0250", "full-is-cr0125"],
+        "think": ["think-is-cr0250", "think-is-cr0125"],
+    }
 
 
 def test_confirm_decision_uses_pooled_quality_then_ten_percent_cost_rule() -> None:

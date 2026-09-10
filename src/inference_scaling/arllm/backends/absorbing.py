@@ -75,6 +75,10 @@ class AbsorbingEOSBackend:
         pending: list[GenerationRequest] = []
         pending_indices: list[int] = []
         for index, request in enumerate(requests):
+            if request.stop_token_ids:
+                raise ValueError(
+                    "the absorbing-EOS adapter does not support extra stop tokens"
+                )
             if request.sampling.eos_token_id is not None:
                 raise ValueError(
                     "the outer fixed-length policy must leave eos_token_id unset; "

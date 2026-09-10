@@ -24,6 +24,7 @@ class GenerationRequest:
     request_id: str
     uniforms: tuple[float, ...] | None = None
     arithmetic_uniform: float | None = None
+    stop_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.max_new_tokens <= 0:
@@ -49,6 +50,20 @@ class GenerationRequest:
                 raise ValueError(
                     "the arithmetic sampling uniform must be finite and in [0, 1)"
                 )
+        if any(token_id < 0 for token_id in self.stop_token_ids):
+            raise ValueError("stop_token_ids must be non-negative")
+        if len(set(self.stop_token_ids)) != len(self.stop_token_ids):
+            raise ValueError("stop_token_ids must be unique")
+        if (
+            self.sampling.eos_token_id is not None
+            and self.sampling.eos_token_id in self.stop_token_ids
+        ):
+            raise ValueError("stop_token_ids must not repeat eos_token_id")
+
+    @property
+    def terminal_token_ids(self) -> tuple[int, ...]:
+        eos = self.sampling.eos_token_id
+        return self.stop_token_ids if eos is None else (eos, *self.stop_token_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +77,7 @@ class SequenceSample:
     finish_reason: str = "length"
     reference_token_logprobs: tuple[float, ...] | None = None
     reference_policy_id: str | None = None
+    termination_token_id: int | None = None
 
     def __post_init__(self) -> None:
         if len(self.token_ids) != len(self.token_logprobs):
@@ -82,6 +98,10 @@ class SequenceSample:
             raise ValueError(
                 "each sampled token must have one reference-policy log-probability"
             )
+        if self.termination_token_id is not None and (
+            not self.token_ids or self.token_ids[-1] != self.termination_token_id
+        ):
+            raise ValueError("termination_token_id must be the final sampled token")
 
     @property
     def logprob(self) -> float:

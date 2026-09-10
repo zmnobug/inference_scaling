@@ -625,6 +625,7 @@ class LowPriorityRunAheadBackend:
                         if request.uniforms is not None
                         else None
                     ),
+                    stop_token_ids=request.stop_token_ids,
                 )
                 sample = self.backend.sample_batch([chunk_request])[0]
                 if not self._outputs_already_observed:
@@ -632,8 +633,7 @@ class LowPriorityRunAheadBackend:
                     self.tree.observe_sample(sample)
                 with self._condition:
                     self._completed_tokens += len(sample.token_ids)
-                eos = request.sampling.eos_token_id
-                stopped = eos is not None and eos in sample.token_ids
+                stopped = sample.finish_reason in {"eos", "stop"}
                 remaining = request.max_new_tokens - len(sample.token_ids)
                 if remaining > 0 and not stopped and sample.token_ids:
                     continuation = GenerationRequest(
@@ -647,6 +647,7 @@ class LowPriorityRunAheadBackend:
                             if request.uniforms is not None
                             else None
                         ),
+                        stop_token_ids=request.stop_token_ids,
                     )
                     with self._condition:
                         may_continue = not self._closed

@@ -422,7 +422,22 @@ class TransformersBackend:
                 float(value) for value in reference_logprobs
             ),
             reference_policy_id=reference_sampling.policy_id,
+            termination_token_id=(
+                int(tokens[-1])
+                if finish_reason in {"eos", "stop"} and tokens
+                else None
+            ),
         )
+
+    @staticmethod
+    def _finish_reason_for_token(
+        request: GenerationRequest, token_id: int
+    ) -> str | None:
+        if request.sampling.eos_token_id == token_id:
+            return "eos"
+        if token_id in request.stop_token_ids:
+            return "stop"
+        return None
 
     def _verify_draft(
         self,
@@ -545,11 +560,9 @@ class TransformersBackend:
             consumed += 1
             if matches_draft:
                 accepted += 1
-            if (
-                request.sampling.eos_token_id is not None
-                and sampled_token == request.sampling.eos_token_id
-            ):
-                finish_reason = "eos"
+            terminal_reason = self._finish_reason_for_token(request, sampled_token)
+            if terminal_reason is not None:
+                finish_reason = terminal_reason
                 break
             if not matches_draft:
                 break
@@ -567,16 +580,14 @@ class TransformersBackend:
                     float(reference_log_probs[len(draft), sampled_token].detach().cpu())
                 )
                 consumed += 1
-                if (
-                    request.sampling.eos_token_id is not None
-                    and sampled_token == request.sampling.eos_token_id
-                ):
-                    finish_reason = "eos"
+                terminal_reason = self._finish_reason_for_token(request, sampled_token)
+                if terminal_reason is not None:
+                    finish_reason = terminal_reason
 
         self._draft_tree.record_verification(proposed=len(draft), accepted=accepted)
         reusable_cache = None
         cached_continuation_tokens = 0
-        if finish_reason != "eos" and consumed < request.max_new_tokens:
+        if finish_reason not in {"eos", "stop"} and consumed < request.max_new_tokens:
             # The cache contains the complete hypothetical draft path.  Retain
             # only the matched draft prefix; the mismatch/bonus token has been
             # sampled by the base model but has not yet been inserted.
@@ -662,11 +673,9 @@ class TransformersBackend:
                 token_logprobs.append(float(selected.detach().cpu()))
                 reference_logprobs.append(float(reference[token].detach().cpu()))
                 consumed += 1
-                if (
-                    request.sampling.eos_token_id is not None
-                    and token == request.sampling.eos_token_id
-                ):
-                    finish_reason = "eos"
+                terminal_reason = self._finish_reason_for_token(request, token)
+                if terminal_reason is not None:
+                    finish_reason = terminal_reason
                     break
                 if consumed >= request.max_new_tokens:
                     break
@@ -947,13 +956,13 @@ class TransformersBackend:
                     reference_logprob_lists[index].append(
                         float(reference_logprobs_cpu[index])
                     )
-                    if (
-                        sampling.eos_token_id is not None
-                        and token == sampling.eos_token_id
-                    ):
-                        finish_reasons[index] = "eos"
+                    terminal_reason = self._finish_reason_for_token(
+                        requests[index], token
+                    )
+                    if terminal_reason is not None:
+                        finish_reasons[index] = terminal_reason
                     if on_complete is not None and (
-                        finish_reasons[index] == "eos"
+                        finish_reasons[index] in {"eos", "stop"}
                         or step + 1 >= requests[index].max_new_tokens
                     ):
                         original_index, request = indexed_requests[index]
@@ -969,16 +978,18 @@ class TransformersBackend:
                         )
                         callback_completed.add(original_index)
 
-                eos_finished = torch_module.tensor(
+                terminal_finished = torch_module.tensor(
                     [
-                        sampling.eos_token_id is not None
-                        and int(sampled_cpu[index]) == sampling.eos_token_id
+                        self._finish_reason_for_token(
+                            requests[index], int(sampled_cpu[index])
+                        )
+                        is not None
                         for index in range(len(requests))
                     ],
                     dtype=torch_module.bool,
                     device=self.device,
                 )
-                active_after = step_active & ~eos_finished
+                active_after = step_active & ~terminal_finished
                 active_after &= torch_module.tensor(
                     [step + 1 < request.max_new_tokens for request in requests],
                     dtype=torch_module.bool,
@@ -1081,7 +1092,7 @@ class TransformersBackend:
         ) = self._verify_draft(
             request, proposal, uniforms, acceptance_uniforms=acceptance_uniforms
         )
-        if finish_reason != "eos" and consumed < request.max_new_tokens:
+        if finish_reason not in {"eos", "stop"} and consumed < request.max_new_tokens:
             if reusable_cache is not None:
                 finish_reason = self._continue_verified_cache(
                     request,
@@ -1100,6 +1111,7 @@ class TransformersBackend:
                     sampling=request.sampling,
                     seed=request.seed,
                     request_id=f"{request.request_id}:verified-tail",
+                    stop_token_ids=request.stop_token_ids,
                 )
                 tail = self._sample_same_policy(
                     [(original_index, tail_request)],

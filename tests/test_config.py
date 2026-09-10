@@ -91,3 +91,37 @@ def test_generation_request_validates_arithmetic_uniform() -> None:
                 "invalid",
                 arithmetic_uniform=value,
             )
+
+
+def test_generation_request_distinguishes_eos_from_extra_stop_tokens() -> None:
+    request = GenerationRequest(
+        (),
+        2,
+        SamplingConfig(eos_token_id=2),
+        1,
+        "stops",
+        stop_token_ids=(7, 8),
+    )
+    assert request.terminal_token_ids == (2, 7, 8)
+    with pytest.raises(ValueError, match="repeat eos"):
+        GenerationRequest(
+            (),
+            2,
+            SamplingConfig(eos_token_id=2),
+            1,
+            "duplicate-eos",
+            stop_token_ids=(2,),
+        )
+
+
+def test_sequence_sample_termination_token_must_be_last() -> None:
+    with pytest.raises(ValueError, match="final sampled token"):
+        SequenceSample(
+            (),
+            (1, 2),
+            (-0.1, -0.2),
+            "policy",
+            "model",
+            "request",
+            termination_token_id=1,
+        )

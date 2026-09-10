@@ -237,6 +237,27 @@ def test_eos_stops_generation_and_statistics_count_real_tokens() -> None:
     assert snapshot.estimated_dense_forward_flops == 6
 
 
+def test_extra_stop_token_stops_without_becoming_model_eos() -> None:
+    model = ConstantLogitModel([0.0, 1.0, 0.0])
+    backend = TransformersBackend(model, TinyTokenizer(), device="cpu")
+    sample = backend.sample_batch(
+        [
+            GenerationRequest(
+                (0,),
+                8,
+                SamplingConfig(eos_token_id=2),
+                4,
+                "reasoning-end",
+                stop_token_ids=(1,),
+            )
+        ]
+    )[0]
+
+    assert sample.token_ids == (1,)
+    assert sample.finish_reason == "stop"
+    assert sample.termination_token_id == 1
+
+
 def test_identical_prefix_prefill_is_computed_once_then_forked() -> None:
     model = ConstantLogitModel([0.5, 0.3, 0.2])
     backend = TransformersBackend(model, TinyTokenizer(), device="cpu")

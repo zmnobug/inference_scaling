@@ -104,3 +104,23 @@ def test_arithmetic_sampling_has_the_autoregressive_sequence_distribution() -> N
         (1, 0): 0.06,
         (1, 1): 0.24,
     }
+
+
+def test_extra_stop_token_is_distinct_from_model_eos() -> None:
+    backend = TabularAutoregressiveBackend({}, fallback=[0.0, 1.0, 0.0])
+    sample = backend.sample_batch(
+        [
+            GenerationRequest(
+                (),
+                4,
+                SamplingConfig(eos_token_id=2),
+                5,
+                "reasoning-end",
+                stop_token_ids=(1,),
+            )
+        ]
+    )[0]
+
+    assert sample.token_ids == (1,)
+    assert sample.finish_reason == "stop"
+    assert sample.termination_token_id == 1

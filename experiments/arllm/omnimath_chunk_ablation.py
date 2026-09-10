@@ -33,7 +33,10 @@ from experiments.shared.statistics import (
     clustered_paired_binary_difference,
     wilson_interval,
 )
-from inference_scaling.arllm.algorithms import run_conditional_is
+from inference_scaling.arllm.algorithms import (
+    run_conditional_is,
+    run_strict_think_only_conditional_is,
+)
 from inference_scaling.arllm.backends import (
     BACKEND_CHOICES,
     ScoreCachingBackend,
@@ -66,6 +69,10 @@ from inference_scaling.shared.stepwise import normalize_log_weights
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 IMPLEMENTATION_FILES = (
     "experiments/arllm/omnimath_chunk_ablation.py",
+    "src/inference_scaling/arllm/algorithms/think_only.py",
+    "src/inference_scaling/arllm/types.py",
+    "src/inference_scaling/arllm/backends/transformers_backend.py",
+    "src/inference_scaling/arllm/backends/vllm_backend.py",
     "src/inference_scaling/shared/evaluation/omnimath.py",
 )
 CHECKPOINT_HASH_CACHE = REPOSITORY_ROOT / ".cache" / "artifact_hashes"
@@ -85,6 +92,40 @@ def chunk_tokens(total_length: int, ratio: float, alignment: int) -> int:
 
 def chunk_arm(ratio: float) -> str:
     return f"is-cr{round(ratio * 1000):04d}"
+
+
+def comparison_chunk_arm(family: str, ratio: float) -> str:
+    if family not in {"full", "think"}:
+        raise ValueError("comparison family must be 'full' or 'think'")
+    return f"{family}-is-cr{round(ratio * 1000):04d}"
+
+
+def _comparison_enabled(config: Mapping[str, Any]) -> bool:
+    return bool(config.get("reasoning", {}).get("enabled", False))
+
+
+def _frozen_comparison_ratio_by_arm(
+    frozen: Mapping[str, Any],
+) -> dict[str, float]:
+    families = frozen.get("families")
+    if not isinstance(families, Mapping) or set(families) != {"full", "think"}:
+        raise ValueError("frozen comparison artifact must contain both IS families")
+    result: dict[str, float] = {}
+    for family in ("full", "think"):
+        values = families[family]
+        if not isinstance(values, Mapping):
+            raise ValueError(f"frozen {family} family must be a mapping")
+        family_arms = tuple(str(value) for value in values.get("arms", ()))
+        family_ratios = tuple(float(value) for value in values.get("ratios", ()))
+        if len(family_arms) != 2 or len(family_ratios) != 2:
+            raise ValueError("comparison confirm requires two frozen arms per family")
+        for arm, ratio in zip(family_arms, family_ratios, strict=True):
+            if arm != comparison_chunk_arm(family, ratio):
+                raise ValueError(f"frozen arm {arm} does not match ratio {ratio}")
+            if arm in result:
+                raise ValueError("frozen comparison arms must be unique")
+            result[arm] = ratio
+    return result
 
 
 def parse_ratios(value: str) -> tuple[float, ...]:
@@ -116,6 +157,7 @@ def _generation_protocol_fingerprint(config: Mapping[str, Any]) -> str:
         {
             "prompt": config.get("prompt", {}),
             "generation": config["generation"],
+            "reasoning": config.get("reasoning"),
             "sampling": config["sampling"],
         }
     )
@@ -206,6 +248,8 @@ def _preflight(
     prompt: TokenSequence,
     sampling: SamplingConfig,
     config: Mapping[str, Any],
+    *,
+    request_namespace: str = "omnimath",
 ) -> dict[str, Any]:
     options = config.get("preflight", {})
     generated_tokens = int(options.get("generated_tokens", 2))
@@ -217,7 +261,7 @@ def _preflight(
                 generated_tokens,
                 sampling,
                 int(config["run"]["seed"]),
-                "omnimath-preflight",
+                f"{request_namespace}-preflight",
             )
         ]
     )[0]
@@ -245,6 +289,89 @@ def _preflight(
         "maximum_token_logprob_absolute_difference": maximum_difference,
         "absolute_tolerance": tolerance,
         "passed": True,
+    }
+
+
+def _contains_subsequence(tokens: TokenSequence, marker: TokenSequence) -> bool:
+    return any(
+        tokens[start : start + len(marker)] == marker
+        for start in range(len(tokens) - len(marker) + 1)
+    )
+
+
+def _reasoning_boundary(
+    backend: Any,
+    prompt: TokenSequence,
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    options = config.get("reasoning")
+    if not isinstance(options, Mapping) or not bool(options.get("enabled", False)):
+        raise ValueError("think-only comparison requires [reasoning].enabled=true")
+    start_text = str(options.get("start_text", "<think>"))
+    end_text = str(options.get("end_text", "</think>"))
+    start_ids = backend.encode(start_text, add_special_tokens=False)
+    end_ids = backend.encode(end_text, add_special_tokens=False)
+    if not start_ids or not _contains_subsequence(prompt, start_ids):
+        raise ValueError("rendered thinking prompt does not contain reasoning start tokens")
+    start_index = next(
+        index
+        for index in range(len(prompt) - len(start_ids) + 1)
+        if prompt[index : index + len(start_ids)] == start_ids
+    )
+    if bool(options.get("require_single_token_end", True)) and len(end_ids) != 1:
+        raise ValueError("strict think-only v1 requires a single-token reasoning end marker")
+    if len(end_ids) != 1:
+        raise ValueError("multi-token reasoning end markers are not implemented")
+    eos = backend.tokenizer.eos_token_id
+    if eos is None:
+        raise ValueError("strict think-only comparison requires a model EOS token")
+    if int(eos) == int(end_ids[0]):
+        raise ValueError("reasoning end token must differ from model EOS")
+    return {
+        "start_text": start_text,
+        "start_token_ids": list(start_ids),
+        "start_in_prompt": True,
+        "start_token_index": start_index,
+        "rendered_prompt_token_ids": list(prompt),
+        "end_text": end_text,
+        "end_token_id": int(end_ids[0]),
+        "model_eos_token_id": int(eos),
+        "shared_max_new_tokens": int(config["generation"]["max_new_tokens"]),
+    }
+
+
+def _output_reasoning_diagnostics(
+    tokens: TokenSequence,
+    reasoning_end_token_id: int,
+    model_eos_token_id: int | None,
+) -> dict[str, Any]:
+    """Describe the reasoning/answer boundary without changing generation."""
+
+    try:
+        end_index = tokens.index(reasoning_end_token_id)
+    except ValueError:
+        end_index = None
+    reasoning_complete = end_index is not None
+    reasoning_tokens = end_index + 1 if end_index is not None else len(tokens)
+    answer_tokens = len(tokens) - reasoning_tokens if reasoning_complete else 0
+    model_eos_before_close = bool(
+        not reasoning_complete
+        and model_eos_token_id is not None
+        and tokens
+        and tokens[-1] == model_eos_token_id
+    )
+    return {
+        "reasoning_complete": reasoning_complete,
+        "reasoning_tokens": reasoning_tokens,
+        "reasoning_body_tokens": (
+            reasoning_tokens - 1 if reasoning_complete else reasoning_tokens
+        ),
+        "reasoning_end_token_count": tokens.count(reasoning_end_token_id),
+        "model_eos_before_reasoning_end": model_eos_before_close,
+        "reasoning_length_unclosed": bool(
+            not reasoning_complete and not model_eos_before_close
+        ),
+        "answer_tokens": answer_tokens,
     }
 
 
@@ -309,6 +436,130 @@ def _conditional_diagnostics(result: Any, candidate_count: int) -> dict[str, Any
     }
 
 
+def _think_only_diagnostics(
+    result: Any,
+    candidate_count: int,
+    reasoning_end_token_id: int,
+) -> dict[str, Any]:
+    ess_values: list[float] = []
+    rewards: list[float] = []
+    valid_rollouts = 0
+    invalid_rollouts = 0
+    reward_token_counts: list[int] = []
+    future_rollout_generations = 0
+    future_rollout_tokens = 0
+    maximum_probabilities: list[float] = []
+    weight_entropies: list[float] = []
+    for step in result.steps:
+        log_weights = [candidate.log_weight for candidate in step.candidates]
+        if step.selected_index is not None:
+            ess_values.append(importance_effective_sample_size(log_weights))
+            maximum_probabilities.append(max(step.probabilities))
+            weight_entropies.append(
+                -sum(
+                    value * math.log(value)
+                    for value in step.probabilities
+                    if value > 0
+                )
+            )
+        for candidate in step.candidates:
+            for rollout in candidate.rollouts:
+                future_rollout_generations += bool(rollout.token_ids)
+                future_rollout_tokens += len(rollout.token_ids)
+                if rollout.valid_reasoning:
+                    valid_rollouts += 1
+                    assert rollout.reward is not None
+                    rewards.append(float(rollout.reward))
+                    reward_token_counts.append(int(rollout.reward_token_count))
+                else:
+                    invalid_rollouts += 1
+    reasoning_complete = bool(
+        result.reasoning_token_ids
+        and result.reasoning_token_ids[-1] == reasoning_end_token_id
+    )
+    diagnostics = _output_reasoning_diagnostics(
+        result.token_ids,
+        reasoning_end_token_id,
+        None,
+    )
+    diagnostics.update(
+        {
+            "guidance_steps": len(result.steps),
+            "selected_block_tokens_by_step": [
+                len(step.selected.token_ids)
+                for step in result.steps
+                if step.selected_index is not None
+            ],
+            "selected_candidate_indices": [
+                step.selected_index for step in result.steps
+            ],
+            "candidate_log_weights_by_step": [
+                [candidate.log_weight for candidate in step.candidates]
+                for step in result.steps
+            ],
+            "candidate_probabilities_by_step": [
+                list(step.probabilities) for step in result.steps
+            ],
+            "mean_candidate_ess_fraction": (
+                statistics.fmean(value / candidate_count for value in ess_values)
+                if ess_values
+                else None
+            ),
+            "mean_maximum_candidate_probability": (
+                statistics.fmean(maximum_probabilities)
+                if maximum_probabilities
+                else None
+            ),
+            "mean_candidate_weight_entropy_nats": (
+                statistics.fmean(weight_entropies) if weight_entropies else None
+            ),
+            "valid_reasoning_weight_contributions": valid_rollouts,
+            "invalid_reasoning_weight_contributions": invalid_rollouts,
+            "reward_contributions": valid_rollouts,
+            "planned_future_rollouts": sum(
+                candidate.planned_rollout_count
+                for step in result.steps
+                for candidate in step.candidates
+            ),
+            "future_rollout_generations": future_rollout_generations,
+            "future_rollout_tokens": future_rollout_tokens,
+            "mean_rollout_reward": statistics.fmean(rewards) if rewards else None,
+            "minimum_rollout_reward": min(rewards) if rewards else None,
+            "maximum_rollout_reward": max(rewards) if rewards else None,
+            "maximum_reward_token_count": max(reward_token_counts, default=0),
+            "reasoning_complete": reasoning_complete,
+            "reasoning_tokens": len(result.reasoning_token_ids),
+            "reasoning_body_tokens": len(result.reasoning_token_ids)
+            - int(reasoning_complete),
+            "reasoning_logprob": sum(result.reasoning_token_logprobs),
+            "reasoning_finish_reason": (
+                "reasoning_end" if reasoning_complete else result.failure_reason
+            ),
+            "answer_tokens": len(result.answer_token_ids),
+            "answer_requests": int(
+                reasoning_complete
+                and result.failure_reason != "answer_budget_exhausted"
+            ),
+            "answers_per_valid_reasoning": (
+                int(result.failure_reason != "answer_budget_exhausted")
+                if reasoning_complete
+                else None
+            ),
+            "answer_finish_reason": result.answer_finish_reason,
+            "answer_diagnostic_logprob": (
+                sum(result.answer_token_logprobs)
+                if result.answer_token_logprobs
+                else None
+            ),
+            "answer_tokens_in_reward": 0,
+            "answer_tokens_in_candidate_or_rollout": 0,
+            "reasoning_end_logprob_covered": reasoning_complete,
+            "failure_reason": result.failure_reason,
+        }
+    )
+    return diagnostics
+
+
 def _run_arm(
     arm: str,
     backend: Any,
@@ -316,6 +567,9 @@ def _run_arm(
     problem_seed: int,
     config: Mapping[str, Any],
     ratio_by_arm: Mapping[str, float],
+    reasoning_end_token_id: int | None = None,
+    *,
+    request_namespace: str = "omnimath",
 ) -> tuple[TokenSequence, dict[str, Any]]:
     total_length = int(config["generation"]["max_new_tokens"])
     sampling = SamplingConfig(
@@ -336,15 +590,25 @@ def _run_arm(
                     total_length,
                     sampling,
                     SeedStream(problem_seed).derive("base"),
-                    f"omnimath:base:{problem_seed}",
+                    f"{request_namespace}:base:{problem_seed}",
                 )
             ]
         )[0]
-        return sample.token_ids, {
+        diagnostics = {
             "sampling_temperature": sampling.temperature,
             "finish_reason": sample.finish_reason,
             "sample_logprob": sample.logprob,
+            "scaling_scope": "none",
         }
+        if reasoning_end_token_id is not None:
+            diagnostics.update(
+                _output_reasoning_diagnostics(
+                    sample.token_ids,
+                    reasoning_end_token_id,
+                    sampling.eos_token_id,
+                )
+            )
+        return sample.token_ids, diagnostics
 
     ratio = ratio_by_arm[arm]
     options = config["conditional_is"]
@@ -357,30 +621,49 @@ def _run_arm(
         sampling,
         scale=float(options["logprob_reward_scale"]),
     )
-    result = run_conditional_is(
-        cached_backend,
-        prompt,
-        ConditionalISConfig(
-            candidate_count=candidate_count,
-            rollout_count=int(options["rollout_count"]),
-            block_size=block_size,
-            total_length=total_length,
-            reward_temperature=float(options["reward_temperature"]),
-            importance_log_ratio_clip=None,
-            apply_importance_correction=bool(options["apply_importance_correction"]),
-            rollout_design=str(options["rollout_design"]),
-            exact_rollout_early_stop=bool(options["exact_rollout_early_stop"]),
-            rollout_evaluation_batch_size=int(options["rollout_evaluation_batch_size"]),
-        ),
-        reward,
-        SeedStream(problem_seed),
-        base_sampling=sampling,
-        rollout_backend=cached_backend,
-        rollout_sampling=sampling,
+    algorithm_config = ConditionalISConfig(
+        candidate_count=candidate_count,
+        rollout_count=int(options["rollout_count"]),
+        block_size=block_size,
+        total_length=total_length,
+        reward_temperature=float(options["reward_temperature"]),
+        importance_log_ratio_clip=None,
+        apply_importance_correction=bool(options["apply_importance_correction"]),
+        rollout_design=str(options["rollout_design"]),
+        exact_rollout_early_stop=bool(options["exact_rollout_early_stop"]),
+        rollout_evaluation_batch_size=int(options["rollout_evaluation_batch_size"]),
     )
-    diagnostics = _conditional_diagnostics(result, candidate_count)
+    think_only = arm.startswith("think-is-")
+    if think_only:
+        if reasoning_end_token_id is None:
+            raise ValueError("think-only arm requires a reasoning end token")
+        result = run_strict_think_only_conditional_is(
+            cached_backend,
+            prompt,
+            algorithm_config,
+            reward,
+            SeedStream(problem_seed),
+            reasoning_end_token_id=reasoning_end_token_id,
+            sampling=sampling,
+        )
+        diagnostics = _think_only_diagnostics(
+            result, candidate_count, reasoning_end_token_id
+        )
+    else:
+        result = run_conditional_is(
+            cached_backend,
+            prompt,
+            algorithm_config,
+            reward,
+            SeedStream(problem_seed),
+            base_sampling=sampling,
+            rollout_backend=cached_backend,
+            rollout_sampling=sampling,
+        )
+        diagnostics = _conditional_diagnostics(result, candidate_count)
     diagnostics.update(
         {
+            "scaling_scope": "reasoning" if think_only else "full_output",
             "chunk_ratio": ratio,
             "chunk_tokens": block_size,
             "chunk_alignment_tokens": alignment,
@@ -399,6 +682,14 @@ def _run_arm(
             "score_cache": asdict(cached_backend.snapshot()),
         }
     )
+    if not think_only and reasoning_end_token_id is not None:
+        diagnostics.update(
+            _output_reasoning_diagnostics(
+                result.token_ids,
+                reasoning_end_token_id,
+                sampling.eos_token_id,
+            )
+        )
     return result.token_ids, diagnostics
 
 
@@ -421,7 +712,20 @@ def _arm_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     ess_values = [
         float(record["diagnostics"]["mean_candidate_ess_fraction"])
         for record in records
-        if "mean_candidate_ess_fraction" in record["diagnostics"]
+        if record["diagnostics"].get("mean_candidate_ess_fraction") is not None
+    ]
+    reasoning_records = [
+        record
+        for record in records
+        if "reasoning_complete" in record["diagnostics"]
+    ]
+    reasoning_lengths = [
+        int(record["diagnostics"]["reasoning_tokens"])
+        for record in reasoning_records
+    ]
+    answer_lengths = [
+        int(record["diagnostics"]["answer_tokens"])
+        for record in reasoning_records
     ]
     return {
         "examples": len(records),
@@ -447,6 +751,44 @@ def _arm_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ),
         "weight_degenerate": bool(
             ess_values and statistics.fmean(ess_values) < 0.25
+        ),
+        "reasoning_closure_rate": (
+            statistics.fmean(
+                bool(record["diagnostics"]["reasoning_complete"])
+                for record in reasoning_records
+            )
+            if reasoning_records
+            else None
+        ),
+        "model_eos_before_reasoning_end_rate": (
+            statistics.fmean(
+                bool(
+                    record["diagnostics"].get(
+                        "model_eos_before_reasoning_end", False
+                    )
+                )
+                for record in reasoning_records
+            )
+            if reasoning_records
+            else None
+        ),
+        "reasoning_length_unclosed_rate": (
+            statistics.fmean(
+                bool(
+                    record["diagnostics"].get(
+                        "reasoning_length_unclosed", False
+                    )
+                )
+                for record in reasoning_records
+            )
+            if reasoning_records
+            else None
+        ),
+        "mean_reasoning_tokens": (
+            statistics.fmean(reasoning_lengths) if reasoning_lengths else None
+        ),
+        "mean_answer_tokens": (
+            statistics.fmean(answer_lengths) if answer_lengths else None
         ),
     }
 
@@ -496,15 +838,38 @@ def build_summary(
             seed=SeedStream(int(manifest["seed"])).derive("paired", left, right),
             replicates=bootstrap_replicates,
         )
-    ranked = sorted(
-        (arm for arm in by_arm if arm != "base"),
-        key=lambda arm: (
+    def ranking_key(arm: str) -> tuple[float, int, float, float]:
+        return (
             -float(summaries[arm]["accuracy"]),
             int(summaries[arm]["total_forward_token_slots"]),
             float(summaries[arm]["sum_example_seconds"]),
             -float(summaries[arm]["mean_candidate_ess_fraction"] or 0.0),
-        ),
+        )
+
+    ranked = sorted((arm for arm in by_arm if arm != "base"), key=ranking_key)
+    comparison = any(
+        arm.startswith(("full-is-", "think-is-")) for arm in ranked
     )
+    ranked_by_family = None
+    recommended_by_family = None
+    if comparison:
+        ranked_by_family = {
+            family: sorted(
+                (arm for arm in ranked if arm.startswith(f"{family}-is-")),
+                key=ranking_key,
+            )
+            for family in ("full", "think")
+        }
+        if any(not values for values in ranked_by_family.values()):
+            raise ValueError("comparison summary requires full and think IS arms")
+        recommended_by_family = (
+            {
+                family: values[:2]
+                for family, values in ranked_by_family.items()
+            }
+            if manifest["phase"] == "screen"
+            else None
+        )
     return {
         "schema_version": 1,
         "manifest_fingerprint": manifest["fingerprint"],
@@ -512,7 +877,13 @@ def build_summary(
         "arms": summaries,
         "paired_accuracy": paired,
         "ranked_is_arms": ranked,
-        "recommended_top2": ranked[:2] if manifest["phase"] == "screen" else None,
+        "ranked_is_arms_by_family": ranked_by_family,
+        "recommended_top2": (
+            ranked[:2]
+            if manifest["phase"] == "screen" and not comparison
+            else None
+        ),
+        "recommended_top2_by_family": recommended_by_family,
         "confirm_winner": None,
         "bootstrap_replicates": bootstrap_replicates,
     }
@@ -608,6 +979,8 @@ def _load_gate(
     path: Path,
     model_fingerprint: str,
     generation_protocol_fingerprint: str,
+    *,
+    require_reasoning_closure: bool = False,
 ) -> tuple[float, float]:
     if not path.is_file():
         raise FileNotFoundError(
@@ -620,6 +993,10 @@ def _load_gate(
         raise ValueError("difficulty gate belongs to a different model checkpoint")
     if gate["generation_protocol_fingerprint"] != generation_protocol_fingerprint:
         raise ValueError("difficulty gate belongs to a different generation protocol")
+    if require_reasoning_closure and not gate.get(
+        "reasoning_closure_gate_passed", False
+    ):
+        raise ValueError("probe reasoning closure gate did not pass")
     return tuple(float(value) for value in gate["selected_difficulty_band"])  # type: ignore[return-value]
 
 
@@ -680,6 +1057,7 @@ def main() -> None:
     _apply_overrides(config, args)
     ratios = tuple(float(value) for value in config["conditional_is"]["chunk_ratios"])
     parse_ratios(",".join(str(value) for value in ratios))
+    comparison_enabled = _comparison_enabled(config)
     if str(config["conditional_is"]["reward"]) != "sequence_log_probability":
         raise ValueError("this experiment requires sequence_log_probability reward")
     if config["sampling"].get("top_p", 1.0) != 1.0 or config["sampling"].get("top_k") is not None:
@@ -709,11 +1087,20 @@ def main() -> None:
             raise ValueError("frozen top-2 belongs to a different model checkpoint")
         if frozen_top2["ablation_protocol_fingerprint"] != _ablation_protocol_fingerprint(config):
             raise ValueError("frozen top-2 belongs to a different fixed IS protocol")
-        frozen_ratios = tuple(float(value) for value in frozen_top2["ratios"])
-        if args.ratios is not None and ratios != frozen_ratios:
-            raise ValueError("--ratios does not match the frozen screen top-2")
-        ratios = frozen_ratios
-        config["conditional_is"]["chunk_ratios"] = list(ratios)
+        if comparison_enabled:
+            if frozen_top2.get("target_definition") != "strict-think-only-is-v1":
+                raise ValueError("frozen comparison artifact has the wrong target")
+            _frozen_comparison_ratio_by_arm(frozen_top2)
+            if args.ratios is not None:
+                raise ValueError(
+                    "--ratios cannot override family-specific frozen confirm arms"
+                )
+        else:
+            frozen_ratios = tuple(float(value) for value in frozen_top2["ratios"])
+            if args.ratios is not None and ratios != frozen_ratios:
+                raise ValueError("--ratios does not match the frozen screen top-2")
+            ratios = frozen_ratios
+            config["conditional_is"]["chunk_ratios"] = list(ratios)
 
     partition_options = config["partitions"]
     if args.phase == "probe":
@@ -732,6 +1119,7 @@ def main() -> None:
             args.difficulty_gate or default_gate,
             model_fingerprint,
             _generation_protocol_fingerprint(config),
+            require_reasoning_closure=comparison_enabled,
         )
     partitions = select_omnimath_partitions(
         all_problems,
@@ -750,11 +1138,23 @@ def main() -> None:
 
     if args.phase == "probe":
         arms = ("base",)
+        ratio_by_arm: dict[str, float] = {}
+    elif comparison_enabled and args.phase == "confirm":
+        assert frozen_top2 is not None
+        ratio_by_arm = _frozen_comparison_ratio_by_arm(frozen_top2)
+        arms = ("base", *ratio_by_arm)
+    elif comparison_enabled:
+        ratio_by_arm = {
+            comparison_chunk_arm(family, ratio): ratio
+            for family in ("full", "think")
+            for ratio in ratios
+        }
+        arms = ("base", *ratio_by_arm)
     else:
-        arms = ("base", *(chunk_arm(ratio) for ratio in ratios))
-    if args.phase == "confirm" and len(ratios) != 2:
-        raise ValueError("confirm requires exactly the two frozen screen ratios")
-    ratio_by_arm = {chunk_arm(ratio): ratio for ratio in ratios}
+        ratio_by_arm = {chunk_arm(ratio): ratio for ratio in ratios}
+        arms = ("base", *ratio_by_arm)
+        if args.phase == "confirm" and len(ratios) != 2:
+            raise ValueError("confirm requires exactly the two frozen screen ratios")
 
     run_dir = run_root / args.phase
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -781,6 +1181,8 @@ def main() -> None:
         "phase": args.phase,
         "tag": args.tag,
         "arms": arms,
+        "comparison_enabled": comparison_enabled,
+        "ratio_by_arm": ratio_by_arm,
         "problem_ids": [problem.problem_id for problem in problems],
         "difficulty_band": difficulty_band,
         "dataset_revision": dataset_revision,
@@ -793,7 +1195,7 @@ def main() -> None:
     }
     fingerprint = json_fingerprint(effective)
     manifest: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2 if comparison_enabled else 1,
         "fingerprint": fingerprint,
         "phase": args.phase,
         "tag": args.tag,
@@ -803,13 +1205,15 @@ def main() -> None:
         "arms": list(arms),
         "ratios": list(ratios),
         "derived_chunk_tokens": {
-            chunk_arm(ratio): chunk_tokens(
+            arm: chunk_tokens(
                 int(config["generation"]["max_new_tokens"]),
                 ratio,
                 int(config["conditional_is"]["chunk_alignment_tokens"]),
             )
-            for ratio in ratios
+            for arm, ratio in ratio_by_arm.items()
         },
+        "comparison_enabled": comparison_enabled,
+        "ratio_by_arm": ratio_by_arm,
         "problem_ids": [problem.problem_id for problem in problems],
         "dataset": {
             "repository": OMNIMATH_RULE_REPOSITORY,
@@ -866,7 +1270,27 @@ def main() -> None:
         if pending:
             backend = load_backend_from_config(str(config["models"]["base"]), config)
             manifest["model"]["parameter_count"] = int(backend.parameter_count)
-            first_prompt = _prompt_tokens(backend, pending[0][0], config)
+            first_prompt = _prompt_tokens(backend, problems[0], config)
+            reasoning_end_token_id = None
+            if comparison_enabled:
+                boundary = _reasoning_boundary(backend, first_prompt, config)
+                if frozen_top2 is not None:
+                    frozen_boundary = frozen_top2.get("reasoning_boundary", {})
+                    stable_boundary_fields = (
+                        "start_token_ids",
+                        "end_token_id",
+                        "model_eos_token_id",
+                        "shared_max_new_tokens",
+                    )
+                    if any(
+                        frozen_boundary.get(field) != boundary[field]
+                        for field in stable_boundary_fields
+                    ):
+                        raise ValueError(
+                            "frozen top-2 reasoning boundary differs from the active model"
+                        )
+                manifest["reasoning_boundary"] = boundary
+                reasoning_end_token_id = int(boundary["end_token_id"])
             sampling = SamplingConfig(
                 temperature=float(config["sampling"]["temperature"]),
                 top_p=float(config["sampling"].get("top_p", 1.0)),
@@ -891,6 +1315,7 @@ def main() -> None:
                         problem_seed,
                         config,
                         ratio_by_arm,
+                        reasoning_end_token_id,
                     )
                     _cuda_sync()
                     elapsed = time.perf_counter() - started
@@ -973,20 +1398,68 @@ def main() -> None:
             "selected_difficulty_band": list(selected_band),
             "generation_protocol_fingerprint": _generation_protocol_fingerprint(config),
         }
+        if comparison_enabled:
+            closed = sum(
+                bool(record["diagnostics"].get("reasoning_complete"))
+                for record in selected
+            )
+            required = int(
+                config["reasoning"].get("closure_gate_min_count", 7)
+            )
+            if not 0 < required <= len(selected):
+                raise ValueError(
+                    "reasoning.closure_gate_min_count must be within the probe size"
+                )
+            gate.update(
+                {
+                    "reasoning_closure_count": closed,
+                    "reasoning_closure_total": len(selected),
+                    "reasoning_closure_required": required,
+                    "reasoning_closure_gate_passed": closed >= required,
+                }
+            )
         _atomic_json(run_root / "difficulty_gate.json", gate)
         summary["difficulty_gate"] = gate
     elif args.phase == "screen":
-        top_arms = list(summary["recommended_top2"])
-        frozen = {
+        frozen: dict[str, Any] = {
             "schema_version": 1,
             "screen_manifest_fingerprint": fingerprint,
             "screen_summary_sha256": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
             "dataset_sha256": OMNIMATH_RULE_DATA_SHA256,
             "model_fingerprint": model_fingerprint,
             "ablation_protocol_fingerprint": _ablation_protocol_fingerprint(config),
-            "arms": top_arms,
-            "ratios": [ratio_by_arm[arm] for arm in top_arms],
         }
+        if comparison_enabled:
+            top_by_family = summary["recommended_top2_by_family"]
+            assert top_by_family is not None
+            frozen.update(
+                {
+                    "schema_version": 2,
+                    "target_definition": "strict-think-only-is-v1",
+                    "shared_max_new_tokens": int(
+                        config["generation"]["max_new_tokens"]
+                    ),
+                    "reasoning_boundary": manifest["reasoning_boundary"],
+                    "families": {
+                        family: {
+                            "arms": list(top_by_family[family]),
+                            "ratios": [
+                                ratio_by_arm[arm]
+                                for arm in top_by_family[family]
+                            ],
+                        }
+                        for family in ("full", "think")
+                    },
+                }
+            )
+        else:
+            top_arms = list(summary["recommended_top2"])
+            frozen.update(
+                {
+                    "arms": top_arms,
+                    "ratios": [ratio_by_arm[arm] for arm in top_arms],
+                }
+            )
         frozen_path = run_root / "frozen_top2.json"
         if frozen_path.is_file():
             previous_frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
@@ -1001,14 +1474,34 @@ def main() -> None:
             raise FileNotFoundError(
                 f"screen records not found at {screen_records_path}"
             )
-        decision = build_confirm_decision(
-            selected,
-            load_jsonl(screen_records_path),
-            ratio_by_arm,
-        )
-        summary["confirm_decision"] = decision
-        summary["confirm_winner"] = decision["winner"]
-        _atomic_json(summary_path, summary)
+        screen_records = load_jsonl(screen_records_path)
+        if comparison_enabled:
+            decisions = {
+                family: build_confirm_decision(
+                    selected,
+                    screen_records,
+                    {
+                        arm: ratio
+                        for arm, ratio in ratio_by_arm.items()
+                        if arm.startswith(f"{family}-is-")
+                    },
+                )
+                for family in ("full", "think")
+            }
+            summary["confirm_decision_by_family"] = decisions
+            summary["confirm_winner_by_family"] = {
+                family: decision["winner"]
+                for family, decision in decisions.items()
+            }
+        else:
+            decision = build_confirm_decision(
+                selected,
+                screen_records,
+                ratio_by_arm,
+            )
+            summary["confirm_decision"] = decision
+            summary["confirm_winner"] = decision["winner"]
+    _atomic_json(summary_path, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
 
 

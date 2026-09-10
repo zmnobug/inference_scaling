@@ -1,5 +1,7 @@
 from math import isinf
 
+import pytest
+
 from inference_scaling.arllm.backends import AbsorbingEOSBackend, TabularAutoregressiveBackend
 from inference_scaling.arllm.config import SamplingConfig
 from inference_scaling.arllm.types import GenerationRequest, ScoreRequest
@@ -30,6 +32,25 @@ def test_absorbing_eos_handles_terminal_prefix_without_model_call() -> None:
     )[0]
     assert sample.token_ids == (1, 1, 1)
     assert sample.token_logprobs == (0.0, 0.0, 0.0)
+
+
+def test_absorbing_eos_rejects_extra_stop_tokens() -> None:
+    inner = TabularAutoregressiveBackend({}, fallback=[0.5, 0.5])
+    backend = AbsorbingEOSBackend(inner, eos_token_id=1, absorbing_after=2)
+
+    with pytest.raises(ValueError, match="extra stop tokens"):
+        backend.sample_batch(
+            [
+                GenerationRequest(
+                    (),
+                    2,
+                    SamplingConfig(),
+                    1,
+                    "extra-stop",
+                    stop_token_ids=(0,),
+                )
+            ]
+        )
 
 
 def test_prompt_eos_is_not_treated_as_generated_eos() -> None:

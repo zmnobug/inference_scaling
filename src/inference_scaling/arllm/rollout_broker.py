@@ -103,6 +103,7 @@ class PartialRollout:
                 if self.request.uniforms is not None
                 else None
             ),
+            stop_token_ids=self.request.stop_token_ids,
         )
 
     def append(
@@ -144,8 +145,9 @@ class PartialRollout:
         else:
             references = (self.reference_token_logprobs or ()) + sample.reference_token_logprobs
             reference_policy_id = sample.reference_policy_id
-        finished = sample.finish_reason == "eos" or len(tokens) >= self.request.max_new_tokens
-        finish_reason = sample.finish_reason if sample.finish_reason == "eos" else (
+        terminal = sample.finish_reason in {"eos", "stop"}
+        finished = terminal or len(tokens) >= self.request.max_new_tokens
+        finish_reason = sample.finish_reason if terminal else (
             "length" if finished else "partial"
         )
         return PartialRollout(
@@ -175,6 +177,11 @@ class PartialRollout:
             finish_reason=self.finish_reason,
             reference_token_logprobs=self.reference_token_logprobs,
             reference_policy_id=self.reference_policy_id,
+            termination_token_id=(
+                self.token_ids[-1]
+                if self.finish_reason in {"eos", "stop"} and self.token_ids
+                else None
+            ),
         )
 
 

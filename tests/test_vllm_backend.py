@@ -118,6 +118,8 @@ class _Engine:
             tokens = [int(policy.seed % 5) + 3] * count
             if policy.stop_token_ids and policy.seed == 12:
                 tokens[-1] = policy.stop_token_ids[0]
+            elif policy.stop_token_ids and policy.seed == 13:
+                tokens[-1] = policy.stop_token_ids[-1]
             outputs.append(
                 _Output(
                     [_Completion(tokens, [{token: _Logprob(-0.25)} for token in tokens])],
@@ -243,6 +245,27 @@ def test_vllm_sampling_preserves_per_request_seed_policy_and_order() -> None:
     assert snapshot.generated_tokens == 4
     assert snapshot.shared_prefill_tokens_saved == 4
     assert snapshot.prefill_tokens == 0
+
+
+def test_vllm_preserves_extra_stop_token_identity() -> None:
+    backend, engine = _backend()
+    sample = backend.sample_batch(
+        [
+            GenerationRequest(
+                (1,),
+                2,
+                SamplingConfig(eos_token_id=2),
+                13,
+                "reasoning-end",
+                stop_token_ids=(7,),
+            )
+        ]
+    )[0]
+
+    assert engine.calls[0][1][0].stop_token_ids == [2, 7]
+    assert sample.token_ids[-1] == 7
+    assert sample.finish_reason == "stop"
+    assert sample.termination_token_id == 7
 
 
 def test_vllm_accepts_upstream_power_logprobs_without_rescoring() -> None:

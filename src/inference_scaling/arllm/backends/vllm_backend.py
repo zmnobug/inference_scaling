@@ -542,9 +542,7 @@ class VLLMBackend:
             logprobs=0,
             flat_logprobs=False,
             ignore_eos=True,
-            stop_token_ids=(
-                [] if policy.eos_token_id is None else [int(policy.eos_token_id)]
-            ),
+            stop_token_ids=[int(token) for token in request.terminal_token_ids],
             detokenize=False,
             skip_special_tokens=False,
             spaces_between_special_tokens=False,
@@ -793,6 +791,8 @@ class VLLMBackend:
         eos = request.sampling.eos_token_id
         if eos is not None and tokens and tokens[-1] == eos:
             finish_reason = "eos"
+        elif tokens and tokens[-1] in request.stop_token_ids:
+            finish_reason = "stop"
         sample = SequenceSample(
             prefix=request.prefix,
             token_ids=tokens,
@@ -804,6 +804,9 @@ class VLLMBackend:
             reference_token_logprobs=reference_values,
             reference_policy_id=(
                 None if reference_values is None else reference_sampling.policy_id
+            ),
+            termination_token_id=(
+                tokens[-1] if finish_reason in {"eos", "stop"} and tokens else None
             ),
         )
         prompt_length = len(self._model_prefix(request.prefix))
