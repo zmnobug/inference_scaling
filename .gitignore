@@ -1,4 +1,5 @@
 .venv/
+.venv-swebench/
 .venv-*/
 venv/
 __pycache__/
