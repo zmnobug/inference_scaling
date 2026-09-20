@@ -197,6 +197,151 @@ def audit_fake_sample(sampler):
     sampler.diagnostics["requests"].append({"response": {"system_fingerprint": "test"}})
 
 
+def unguarded_sampler():
+    return guarded_sampler(max_steps_per_round=0, max_round_seconds=0,
+                           max_rollout_tokens=0, fallback_to_plain=False)
+
+
+@pytest.mark.parametrize("shared_body_prefix", ["", "/"])
+def test_zero_thinking_selects_uniformly_then_samples_exact_action_once(shared_body_prefix):
+    sampler = unguarded_sampler()
+    command = "opt/python --version" if shared_body_prefix else "echo ok"
+    vocabulary = {101: "<mswea_bash_command", 102: ">" + shared_body_prefix,
+                  103: command + "</mswea_bash_command>", 104: "<|im_end|>"}
+    sampler._decode = lambda values: ''.join(vocabulary[token.token_id] for token in values)
+    observed = []
+
+    def sample(prompt, maximum, role):
+        audit_fake_sample(sampler)
+        observed.append((list(prompt), maximum, role))
+        assert role in {"candidate", "action"}
+        ids = [101, 102] if role == "candidate" else [103, 104]
+        assert len(ids) <= maximum
+        return [Token(token_id, -1, 2) for token_id in ids], "stop"
+
+    sampler._sample = sample
+    decision = sampler([], 500, time.monotonic() + 100)
+    round_record = sampler.diagnostics["rounds"][0]
+    step = round_record["steps"][0]
+    assert [role for _, _, role in observed] == ["candidate"] * 4 + ["action"]
+    assert observed[-1] == ([1, 2, 101, 102], 498, "action")
+    assert step["weights"] == [0.25] * 4
+    assert step["ess"] == 4
+    assert step["selection_mode"] == "empty_thinking_uniform"
+    assert all(candidate["empty_thinking"] and candidate["rewards"] == [None, None]
+               and not candidate["rollout_request_ids"] for candidate in step["candidates"])
+    assert round_record["thinking_tokens"] == 0
+    assert round_record["sampled_body_prefix"] == shared_body_prefix
+    assert "fallback_reason" not in round_record
+    assert decision.messages[0]["extra"]["actions"] == [{"command": shared_body_prefix + command}]
+    assert decision.output_tokens == 4
+    assert decision.token_logprobs == (-1, -1, -1)
+    assert decision.termination_status == "scored"
+    assert sampler.diagnostics["protocol"] == "thinking-is-token-prefix-v3"
+
+
+def test_zero_thinking_does_not_change_weights_when_scored_candidates_exist():
+    sampler = unguarded_sampler()
+    contents = iter([OPEN_ACTION, "THOUGHT" + OPEN_ACTION, OPEN_ACTION, "PLAN" + OPEN_ACTION])
+
+    def sample(prompt, maximum, role):
+        audit_fake_sample(sampler)
+        assert role in {"candidate", "action"}
+        return tokens(next(contents) if role == "candidate" else "echo ok</mswea_bash_command>"), "stop"
+
+    sampler._sample = sample
+    decision = sampler([], 500, time.monotonic() + 100)
+    step = sampler.diagnostics["rounds"][0]["steps"][0]
+    assert step["weights"] == list(reward_weights([candidate["rewards"] for candidate in step["candidates"]]))
+    assert step["weights"][0] == step["weights"][2] == 0
+    assert step["selected"] in (1, 3)
+    assert "selection_mode" not in step
+    assert decision.kind == "action"
+
+
+def test_zero_thinking_only_selects_valid_empty_candidates_among_invalid_proposals():
+    from inference_scaling.swebench.thinking_is import InvalidSample
+
+    sampler = unguarded_sampler()
+    contents = iter([OPEN_ACTION, None, "<|im_end|>" + OPEN_ACTION, "unterminated thinking"])
+
+    def sample(prompt, maximum, role):
+        audit_fake_sample(sampler)
+        assert role in {"candidate", "action"}
+        content = next(contents) if role == "candidate" else "echo ok</mswea_bash_command>"
+        if content is None:
+            raise InvalidSample("completion scores do not cover all generated tokens")
+        return tokens(content), "stop"
+
+    sampler._sample = sample
+    decision = sampler([], 500, time.monotonic() + 100)
+    step = sampler.diagnostics["rounds"][0]["steps"][0]
+    assert step["weights"] == [1, 0, 0, 0]
+    assert step["selected"] == 0
+    assert step["candidates"][1]["error"] == "completion scores do not cover all generated tokens"
+    assert decision.kind == "action"
+
+
+@pytest.mark.parametrize("fault", ["scores", "eos", "unfinished", "shared_thinking_token", "nonfinite_reward"])
+def test_zero_thinking_policy_does_not_rescue_truly_invalid_candidates(fault):
+    from inference_scaling.swebench.thinking_is import InvalidSample
+
+    sampler = unguarded_sampler()
+    if fault == "shared_thinking_token":
+        sampler._decode = lambda values: "THOUGHT" + OPEN_ACTION if values else ""
+    if fault == "nonfinite_reward":
+        sampler.reward = SimpleNamespace(_trajectory_score=lambda values: float("nan"))
+
+    def sample(prompt, maximum, role):
+        audit_fake_sample(sampler)
+        assert role == "candidate"
+        if fault == "scores":
+            raise InvalidSample("missing logprobs")
+        if fault == "shared_thinking_token":
+            return [Token(101, -1, 2)], "stop"
+        content = "<|im_end|>" + OPEN_ACTION if fault == "eos" else "unfinished"
+        if fault == "nonfinite_reward":
+            content = "THOUGHT" + OPEN_ACTION
+        return tokens(content), "stop"
+
+    sampler._sample = sample
+    with pytest.raises(SamplingStopped, match="no_valid_thinking_rollout"):
+        sampler([], 500, time.monotonic() + 100)
+    assert "selected" not in sampler.diagnostics["rounds"][0]["steps"][0]
+
+
+@pytest.mark.parametrize("budget_source", ["trajectory", "context"])
+def test_zero_thinking_does_not_bypass_remaining_output_budget(budget_source):
+    sampler = unguarded_sampler()
+    maximum = len(OPEN_ACTION)
+    if budget_source == "context":
+        sampler.factory.experiment.agent.context_window = 2 + 10 + maximum
+
+    def sample(prompt, requested, role):
+        audit_fake_sample(sampler)
+        assert role == "candidate"
+        assert requested == maximum
+        return tokens(OPEN_ACTION), "stop"
+
+    sampler._sample = sample
+    with pytest.raises(SamplingStopped, match="trajectory_output_limit"):
+        sampler([], maximum if budget_source == "trajectory" else 500, time.monotonic() + 100)
+
+
+def test_zero_thinking_does_not_repair_malformed_action():
+    sampler = unguarded_sampler()
+
+    def sample(prompt, maximum, role):
+        audit_fake_sample(sampler)
+        assert role in {"candidate", "action"}
+        return tokens(OPEN_ACTION if role == "candidate" else "echo unfinished"), "length"
+
+    sampler._sample = sample
+    decision = sampler([], 500, time.monotonic() + 100)
+    assert decision.kind == "format_error"
+    assert sampler.diagnostics["rounds"][0]["parser_valid"] is False
+
+
 def test_shared_end_token_survives_exact_action_prefix():
     sampler = guarded_sampler()
     vocabulary = {11: "THOUGHT", 12: "<mswea_bash_command", 17566: ">/",

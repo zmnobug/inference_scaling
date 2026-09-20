@@ -93,9 +93,10 @@ class ThinkingISSampler:
         self.reward = ConsilienceReward(None, top_k=5, skip_fraction=0.05,
                                         window_fraction=0.2, initial_penalty=3.0, scale=1.0)
         self.rng = random.Random(self._seed("selection"))
-        self.diagnostics = {"protocol": "thinking-is-token-prefix-v2", "chunk_tokens": arm.chunk_tokens,
+        self.diagnostics = {"protocol": "thinking-is-token-prefix-v3", "chunk_tokens": arm.chunk_tokens,
                             "candidate_count": arm.candidate_count, "rollout_count": arm.rollout_count,
-                            "reward_temperature": 2.0, "requests": [], "rounds": []}
+                            "reward_temperature": 2.0, "empty_thinking_policy": "uniform_if_no_scored_candidate",
+                            "requests": [], "rounds": []}
         self.diagnostics["guards"] = {
             name: getattr(arm, name, 0)
             for name in ("max_steps_per_round", "max_round_seconds", "max_rollout_tokens", "fallback_to_plain")
@@ -283,7 +284,7 @@ class ThinkingISSampler:
     def _select_step(self, prompt_ids, selected, maximum, round_record):
         if len(selected) >= maximum:
             raise SamplingStopped("trajectory_output_limit")
-        candidates, rewards = [], []
+        candidates, rewards, empty_candidates = [], [], []
         step = {"prefix_tokens": len(selected), "candidates": []}
         round_record["steps"].append(step)
         for candidate_index in range(self.arm.candidate_count):
@@ -300,6 +301,9 @@ class ThinkingISSampler:
                 continue
             if boundary is not None:
                 candidate = candidate[:boundary[1]]
+            empty_thinking = boundary is not None and boundary[0] == 0 and self._decode(candidate).startswith(OPEN_ACTION)
+            if empty_thinking:
+                empty_candidates.append(candidate_index)
             candidate_rewards = []
             request_ids = []
             for rollout_index in range(self.arm.rollout_count):
@@ -323,8 +327,14 @@ class ThinkingISSampler:
             rewards.append(candidate_rewards)
             step["candidates"].append({"index": candidate_index, "token_ids": [token.token_id for token in candidate],
                                        "rollout_request_ids": request_ids, "rewards": candidate_rewards,
+                                       "empty_thinking": empty_thinking,
                                        "terminal_thinking": boundary is not None})
-        weights = reward_weights(rewards)
+        if empty_candidates and not any(value is not None for group in rewards for value in group):
+            weights = tuple(1 / len(empty_candidates) if index in empty_candidates else 0.0
+                            for index in range(len(candidates)))
+            step["selection_mode"] = "empty_thinking_uniform"
+        else:
+            weights = reward_weights(rewards)
         choice = categorical_index(weights, self.rng)
         selected = candidates[choice]
         step.update(selected=choice, weights=list(weights), ess=effective_sample_size(weights))
