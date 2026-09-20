@@ -98,7 +98,7 @@ class BudgetLedger:
                 raise ExperimentBudgetExceeded(
                     f"{label} budget exceeded: {actual} > {maximum}"
                 )
-        if self._elapsed() > self.config.max_wall_seconds:
+        if self.config.max_wall_seconds > 0 and self._elapsed() > self.config.max_wall_seconds:
             raise ExperimentBudgetExceeded(
                 f"wall budget exceeded: {self._elapsed():.3f} > "
                 f"{self.config.max_wall_seconds}"
@@ -1171,6 +1171,8 @@ class MiniAgentSessionFactory:
         self.mini_config.setdefault("environment", {})[
             "environment_class"
         ] = experiment.run.environment_class
+        if experiment.agent.wall_time_limit_seconds == 0 and experiment.run.environment_class == "docker":
+            self.mini_config["environment"]["container_timeout"] = "infinity"
         agent_config = self.mini_config.setdefault("agent", {})
         agent_config["step_limit"] = experiment.agent.step_limit
         agent_config["cost_limit"] = experiment.agent.cost_limit
@@ -1178,6 +1180,8 @@ class MiniAgentSessionFactory:
             experiment.agent.wall_time_limit_seconds
         )
         agent_config["output_path"] = None
+        if getattr(experiment.agent, "context_window", 0):
+            agent_config["max_consecutive_format_errors"] = experiment.agent.max_consecutive_format_errors
 
     def make_model(self, namespace: str, seed: int, chunk_tokens: int):
         section = copy.deepcopy(self.mini_config.get("model", {}))

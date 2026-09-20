@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tomllib
 from dataclasses import asdict, dataclass
@@ -14,6 +15,14 @@ from typing import Any, Mapping, Sequence
 MINI_SWE_AGENT_COMMIT = "25941c89cfbc91eb40b3f8756348c91d9977d57e"
 SWE_BENCH_VERSION = "5.0.1"
 SUFFIX_SCHEDULES = frozenset({"full", "uniform", "inverse_length", "multiscale"})
+THINKING_GUARDS = ("max_steps_per_round", "max_round_seconds", "max_rollout_tokens", "fallback_to_plain")
+AGENT_GUARDS = ("finalization_reserve_seconds", "audit_patch_timeout_seconds", "verification_reminder")
+
+
+def _omit_disabled_guards(payload: dict[str, Any], names: Sequence[str]) -> None:
+    for name in names:
+        if not payload.get(name):
+            payload.pop(name, None)
 
 
 def _positive(name: str, value: int | float) -> None:
@@ -148,12 +157,31 @@ class AgentConfig:
     wall_time_limit_seconds: int
     action_mode: str
     max_trajectory_output_tokens: int
+    context_window: int = 0
+    context_safety_tokens: int = 256
+    max_consecutive_format_errors: int = 1
+    finalization_reserve_seconds: int = 0
+    audit_patch_timeout_seconds: int = 0
+    verification_reminder: bool = False
 
     def __post_init__(self) -> None:
         _positive("agent.step_limit", self.step_limit)
+        _positive("agent.max_consecutive_format_errors", self.max_consecutive_format_errors)
+        if self.finalization_reserve_seconds < 0 or (
+            self.finalization_reserve_seconds
+            and self.finalization_reserve_seconds >= self.wall_time_limit_seconds
+        ):
+            raise ValueError("finalization reserve requires a finite case deadline and must be below it")
+        if not 0 <= self.audit_patch_timeout_seconds <= 60:
+            raise ValueError("audit patch timeout must be between 0 and 60 seconds")
+        if self.context_window < 0 or self.context_safety_tokens < 0:
+            raise ValueError("agent context limits must be non-negative")
+        if self.context_window and self.context_window <= self.context_safety_tokens:
+            raise ValueError("context_window must exceed context_safety_tokens")
         if self.cost_limit < 0:
             raise ValueError("agent.cost_limit must be non-negative")
-        _positive("agent.wall_time_limit_seconds", self.wall_time_limit_seconds)
+        if self.wall_time_limit_seconds < 0:
+            raise ValueError("agent.wall_time_limit_seconds must be non-negative")
         _positive(
             "agent.max_trajectory_output_tokens",
             self.max_trajectory_output_tokens,
@@ -174,9 +202,9 @@ class BudgetConfig:
     max_wall_seconds: int
 
     def __post_init__(self) -> None:
-        for name in ("max_api_requests", "max_tool_calls", "max_wall_seconds"):
+        for name in ("max_api_requests", "max_tool_calls"):
             _positive(f"budget.{name}", getattr(self, name))
-        for name in ("max_input_tokens", "max_output_tokens"):
+        for name in ("max_input_tokens", "max_output_tokens", "max_wall_seconds"):
             if getattr(self, name) < 0:
                 raise ValueError(f"budget.{name} must be non-negative")
 
@@ -192,16 +220,29 @@ class ExperimentArm:
     max_suffix_actions: int | None = None
     suffix_schedule: str | None = None
     chains: int | None = None
+    max_steps_per_round: int = 0
+    max_round_seconds: float = 0
+    max_rollout_tokens: int = 0
+    fallback_to_plain: bool = False
 
     def __post_init__(self) -> None:
-        if self.method not in {"base", "is", "mh"}:
-            raise ValueError("arm method must be base, is, or mh")
+        for name in THINKING_GUARDS[:-1]:
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"arm.{name} must be finite and non-negative")
+        if any(getattr(self, name) for name in THINKING_GUARDS):
+            if self.method != "is_thinking":
+                raise ValueError("thinking budget guards require is_thinking")
+            if not self.fallback_to_plain:
+                raise ValueError("thinking budget guards require explicit fallback_to_plain")
+        if self.method not in {"base", "is", "mh", "is_thinking"}:
+            raise ValueError("arm method must be base, is, mh, or is_thinking")
         if self.alpha < 1:
             raise ValueError("arm alpha must be at least one")
         if self.chunk_tokens is None:
             raise ValueError("every arm requires chunk_tokens")
         _positive("arm.chunk_tokens", self.chunk_tokens)
-        if self.method == "is":
+        if self.method in {"is", "is_thinking"}:
             if self.candidate_count is None or self.rollout_count is None:
                 raise ValueError("IS arm requires candidate_count and rollout_count")
             _positive("arm.candidate_count", self.candidate_count)
@@ -227,7 +268,7 @@ class ExperimentArm:
         if self.method == "base":
             return "base"
         values = [self.method, f"a{self.alpha:g}"]
-        if self.method == "is":
+        if self.method in {"is", "is_thinking"}:
             values.extend(
                 [
                     f"b{self.candidate_count}",
@@ -246,11 +287,16 @@ class ExperimentArm:
                     f"c{self.chunk_tokens}",
                 ]
             )
+        if self.method == "is_thinking" and self.fallback_to_plain:
+            values.extend([f"s{self.max_steps_per_round}", f"t{self.max_round_seconds:g}",
+                           f"rt{self.max_rollout_tokens}", "plain"])
         return "-".join(values)
 
     @property
     def fingerprint(self) -> str:
-        encoded = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        payload = asdict(self)
+        _omit_disabled_guards(payload, THINKING_GUARDS)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -266,6 +312,17 @@ class ExperimentConfig:
     def __post_init__(self) -> None:
         if not self.arms:
             raise ValueError("config requires at least one [[arms]] entry")
+        if self.agent.context_window and (
+            self.run.workers != 1 or any(arm.method not in {"base", "is_thinking"} for arm in self.arms)
+        ):
+            raise ValueError("context-aware runner requires workers=1 and base/is_thinking arms")
+        if any(arm.method == "is_thinking" for arm in self.arms):
+            if not self.agent.context_window:
+                raise ValueError("is_thinking requires a context_window")
+            if self.api.logprob_mode != "visible_tokens":
+                raise ValueError("is_thinking requires visible_tokens logprob mode")
+            if any(arm.alpha != 1 for arm in self.arms if arm.method == "is_thinking"):
+                raise ValueError("is_thinking uses Consilience weights, not alpha tempering")
         if any(
             int(arm.chunk_tokens or 0) > self.agent.max_trajectory_output_tokens
             for arm in self.arms
@@ -283,6 +340,9 @@ class ExperimentConfig:
         payload = asdict(self)
         payload["path"] = str(self.path)
         payload["run"]["output_root"] = str(self.run.output_root)
+        _omit_disabled_guards(payload["agent"], AGENT_GUARDS)
+        for arm in payload["arms"]:
+            _omit_disabled_guards(arm, THINKING_GUARDS)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -308,6 +368,10 @@ def _load_arms(payload: Mapping[str, Any]) -> tuple[ExperimentArm, ...]:
         arms.append(
             ExperimentArm(
                 method=method,
+                max_steps_per_round=int(raw_arm.get("max_steps_per_round", 0)),
+                max_round_seconds=float(raw_arm.get("max_round_seconds", 0)),
+                max_rollout_tokens=int(raw_arm.get("max_rollout_tokens", 0)),
+                fallback_to_plain=bool(raw_arm.get("fallback_to_plain", False)),
                 alpha=float(raw_arm.get("alpha", 1.0)),
                 candidate_count=(
                     int(raw_arm["candidate_count"])
@@ -400,6 +464,12 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             max_trajectory_output_tokens=int(
                 agent.get("max_trajectory_output_tokens", 8192)
             ),
+            context_window=int(agent.get("context_window", 0)),
+            context_safety_tokens=int(agent.get("context_safety_tokens", 256)),
+            max_consecutive_format_errors=int(agent.get("max_consecutive_format_errors", 1)),
+            finalization_reserve_seconds=int(agent.get("finalization_reserve_seconds", 0)),
+            audit_patch_timeout_seconds=int(agent.get("audit_patch_timeout_seconds", 0)),
+            verification_reminder=bool(agent.get("verification_reminder", False)),
         ),
         budget=BudgetConfig(
             max_api_requests=int(budget.get("max_api_requests", 5000)),
