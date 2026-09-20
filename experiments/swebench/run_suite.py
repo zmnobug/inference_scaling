@@ -178,6 +178,8 @@ def main() -> None:
     workers = int(args.workers or experiment.run.workers)
     if workers <= 0:
         raise ValueError("workers must be positive")
+    if getattr(getattr(experiment, "agent", None), "context_window", 0) and workers != 1:
+        raise ValueError("context-aware baseline requires workers=1")
 
     all_instances = _load_instances(
         experiment.run.subset,
@@ -324,18 +326,27 @@ def main() -> None:
         }
 
     failures = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(run_job, job): job for job in jobs}
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            with print_lock:
-                print(json.dumps(result, sort_keys=True), flush=True)
+    if workers == 1:
+        for job in jobs:
+            result = run_job(job)
+            print(json.dumps(result, sort_keys=True), flush=True)
             if result["status"] == "error":
                 failures += 1
                 if args.fail_fast:
-                    for pending in futures:
-                        pending.cancel()
                     break
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(run_job, job): job for job in jobs}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                with print_lock:
+                    print(json.dumps(result, sort_keys=True), flush=True)
+                if result["status"] == "error":
+                    failures += 1
+                    if args.fail_fast:
+                        for pending in futures:
+                            pending.cancel()
+                        break
 
     rebuild_predictions(
         output_root,
