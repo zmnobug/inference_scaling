@@ -97,6 +97,11 @@ def _run_base(
     if arm.chunk_tokens is None:
         raise ValueError("Base arm is missing chunk_tokens")
     session = factory.create("base", seed, arm.chunk_tokens)
+    if factory.experiment.agent.context_window:
+        from inference_scaling.swebench.baseline import run_budgeted_baseline
+
+        limits = run_budgeted_baseline(session, factory.experiment, factory.runtime)
+        return session, {"base": _session_summary(session), "limits": limits}
     session.run_to_end()
     return session, {"base": _session_summary(session)}
 
@@ -474,6 +479,20 @@ def run_experiment_arm(
         runtime_fingerprint = str(factory.runtime["fingerprint"])
         if arm.method == "base":
             session, diagnostics = _run_base(factory, arm, seed)
+            if diagnostics.get("limits", {}).get("error"):
+                status = "error"
+                error = diagnostics["limits"]["error"]
+        elif arm.method == "is_thinking":
+            from inference_scaling.swebench.baseline import run_budgeted_baseline
+            from inference_scaling.swebench.thinking_is import ThinkingISSampler
+
+            session = factory.create("is-thinking", seed, experiment.agent.max_trajectory_output_tokens)
+            sampler = ThinkingISSampler(factory, arm, seed)
+            limits = run_budgeted_baseline(session, experiment, factory.runtime, decision_sampler=sampler)
+            diagnostics = {"limits": limits, "thinking_is": sampler.diagnostics, "base": _session_summary(session)}
+            if limits.get("error"):
+                status = "error"
+                error = limits["error"]
         elif arm.method == "is":
             session, diagnostics = _run_conditional_is(factory, arm, seed)
         elif arm.method == "mh":

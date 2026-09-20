@@ -142,6 +142,12 @@ def main() -> None:
             "response_model": metadata["response_model"],
             "system_fingerprint": metadata["system_fingerprint"],
         }
+        thinking_arms = [arm for arm in experiment.arms if arm.method == "is_thinking"]
+        if thinking_arms:
+            from inference_scaling.swebench.thinking_is import ThinkingISSampler
+
+            probe = ThinkingISSampler(factory, thinking_arms[0], experiment.run.seeds[0]).preflight()
+            checks["thinking_is"] = {key: value for key, value in probe.items() if key != "requests"}
 
     print(json.dumps({"status": "ok", "checks": checks}, indent=2, sort_keys=True))
 
