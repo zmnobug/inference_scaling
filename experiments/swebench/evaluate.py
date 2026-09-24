@@ -15,7 +15,7 @@ from experiments.swebench.dataset import (
     validate_evaluator_instances,
 )
 from experiments.swebench.evaluation_summary import summarize_evaluations
-from experiments.swebench.io import atomic_write_json
+from experiments.swebench.io import atomic_write_json, sha256_json
 
 
 def _load_parquet_rows(path: Path) -> list[dict[str, Any]]:
@@ -119,7 +119,17 @@ def main() -> None:
             if len(model_names) != 1:
                 raise ValueError(f"{predictions} must contain exactly one model name")
             model_slug = next(iter(model_names)).replace("/", "__")
-            run_id = f"{args.run_prefix}-{arm_tag}-seed{seed}"
+            input_fingerprint = sha256_json(
+                {
+                    "predictions": prediction_payload,
+                    "dataset_sha256": dataset_provenance["sha256"],
+                    "split": split,
+                }
+            )
+            run_id = (
+                f"{args.run_prefix}-{arm_tag}-seed{seed}"
+                f"-input-{input_fingerprint[:20]}"
+            )
             report_path = evaluation_root / f"{model_slug}.{run_id}.json"
             normalized_report = (
                 evaluation_root / "reports" / arm_tag / f"seed-{seed}.json"

@@ -98,6 +98,7 @@ def _run_base(
     if arm.chunk_tokens is None:
         raise ValueError("Base arm is missing chunk_tokens")
     session = factory.create("base", seed, arm.chunk_tokens)
+    factory.active_session = session
     if factory.experiment.agent.context_window:
         from inference_scaling.swebench.baseline import run_budgeted_baseline
 
@@ -121,6 +122,7 @@ def _run_conditional_is(
 
     rng = random.Random(derive_seed(seed, "is", "selection"))
     main = factory.create("is-main", seed, arm.chunk_tokens)
+    factory.active_session = main
     steps: list[dict[str, Any]] = []
     step_index = 0
     active_parent_checkpoint: SessionCheckpoint | None = None
@@ -211,6 +213,7 @@ def _run_conditional_is(
         )
         previous_main = main
         main = candidate_sessions[selected]
+        factory.active_session = main
         previous_main.close()
         for candidate_index, candidate_session in enumerate(candidate_sessions):
             if candidate_index != selected:
@@ -274,6 +277,7 @@ def _new_checkpointed_trajectory(
     chunk_tokens: int,
 ) -> tuple[MiniAgentSession, list[SessionCheckpoint]]:
     initial = factory.create(namespace, seed, chunk_tokens)
+    factory.active_session = initial
     initial_checkpoint = factory.checkpoint(initial)
     current, suffix_checkpoints = _continue_with_checkpoints(
         factory,
@@ -388,6 +392,7 @@ def _run_mh_chain(
                 previous = current
                 discarded = current_checkpoints[cut + 1 :]
                 current = proposal
+                factory.active_session = current
                 current_checkpoints = [
                     *current_checkpoints[: cut + 1],
                     *proposal_suffix_checkpoints,
@@ -437,6 +442,7 @@ def _run_mh(
         sessions.append(session)
         diagnostics.append(chain_diagnostics)
     selected = sessions[chosen_chain]
+    factory.active_session = selected
     for index, session in enumerate(sessions):
         if index != chosen_chain:
             session.close()
@@ -550,8 +556,25 @@ def run_experiment_arm(
             exit_status = session.exit_status or type(exc).__name__
             trajectory = session.serialize()
     finally:
+        if session is None and factory is not None:
+            session = getattr(factory, "active_session", None)
+            if session is not None:
+                exit_status = str((error or {}).get("type", "Interrupted"))
+                diagnostics["recovered_session"] = {
+                    "exit_status": session.exit_status,
+                    "submission_is_official": False,
+                }
+                try:
+                    trajectory = session.serialize()
+                except Exception as serialization_error:
+                    diagnostics["trajectory_error"] = {
+                        "type": type(serialization_error).__name__,
+                        "message": str(serialization_error),
+                    }
         audit_timeout = getattr(getattr(experiment, "agent", None), "audit_patch_timeout_seconds", 0)
-        if audit_timeout and session is not None and session.exit_status != "Submitted":
+        if audit_timeout and session is not None and (
+            session.exit_status != "Submitted" or status != "completed"
+        ):
             diagnostics["workspace_audit"] = capture_workspace_patch(session, audit_timeout)
         if factory is not None:
             diagnostics["task_environment"] = getattr(factory, "environment_checks", [])

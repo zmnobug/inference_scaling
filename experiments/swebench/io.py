@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from inference_scaling.swebench.config import (
     ExperimentArm,
@@ -133,6 +133,21 @@ def existing_record_matches(
         _sampling_details_path(path, record)
     except (OSError, ValueError):
         return False
+    return record_matches_experiment(
+        record, experiment, arm, seed, instance,
+        runtime_fingerprint=runtime_fingerprint,
+    ) and record.get("status") in {"completed", "budget_exceeded"}
+
+
+def record_matches_experiment(
+    record: Mapping[str, Any],
+    experiment: ExperimentConfig,
+    arm: ExperimentArm,
+    seed: int,
+    instance: Mapping[str, Any],
+    *,
+    runtime_fingerprint: str | None,
+) -> bool:
     return (
         record.get("schema_version") == RESULT_SCHEMA_VERSION
         and record.get("config_fingerprint") == experiment.fingerprint
@@ -142,8 +157,7 @@ def existing_record_matches(
             runtime_fingerprint is None
             or record.get("runtime_fingerprint") == runtime_fingerprint
         )
-        and int(record.get("seed", -1)) == seed
-        and record.get("status") in {"completed", "budget_exceeded"}
+        and record.get("seed") == seed
     )
 
 
@@ -152,6 +166,8 @@ def rebuild_predictions(
     arms: Sequence[ExperimentArm],
     seeds: Sequence[int],
     instance_ids: Sequence[str],
+    *,
+    record_validator: Callable[[Mapping[str, Any], ExperimentArm, int], bool] | None = None,
 ) -> None:
     allowed_instance_ids = set(instance_ids)
     for arm in arms:
@@ -164,6 +180,10 @@ def rebuild_predictions(
                     record = json.loads(path.read_text(encoding="utf-8"))
                     instance_id = str(record["instance_id"])
                     if instance_id not in allowed_instance_ids:
+                        continue
+                    if path.parent.name != instance_id:
+                        continue
+                    if record_validator is not None and not record_validator(record, arm, seed):
                         continue
                     predictions[instance_id] = {
                         "model_name_or_path": str(record["model_name_or_path"]),

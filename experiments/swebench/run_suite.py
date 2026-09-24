@@ -20,6 +20,7 @@ from experiments.swebench.io import (
     existing_record_matches,
     externalize_sampling_details,
     rebuild_predictions,
+    record_matches_experiment,
     result_directory,
 )
 from inference_scaling.swebench.config import (
@@ -214,7 +215,7 @@ def main() -> None:
         runtime_fingerprint=runtime_fingerprint,
     )
     manifest_path = output_root / "manifest.json"
-    if manifest_path.exists() and not args.redo:
+    if manifest_path.exists():
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
         comparable_keys = ["schema_version", "config_fingerprint", "dataset", "arms", "seeds"]
         if runtime_fingerprint is not None:
@@ -350,11 +351,20 @@ def main() -> None:
                             pending.cancel()
                         break
 
+    instances_by_id = {str(instance["instance_id"]): instance for instance in instances}
+
+    def record_is_current(record, arm, seed) -> bool:
+        return record_matches_experiment(
+            record, experiment, arm, seed, instances_by_id[str(record["instance_id"])],
+            runtime_fingerprint=runtime_fingerprint,
+        )
+
     rebuild_predictions(
         output_root,
         arms,
         seeds,
         [str(instance["instance_id"]) for instance in instances],
+        record_validator=record_is_current,
     )
     from experiments.swebench.summarize import summarize_results
 
