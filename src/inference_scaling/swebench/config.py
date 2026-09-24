@@ -16,7 +16,7 @@ MINI_SWE_AGENT_COMMIT = "25941c89cfbc91eb40b3f8756348c91d9977d57e"
 SWE_BENCH_VERSION = "5.0.1"
 SUFFIX_SCHEDULES = frozenset({"full", "uniform", "inverse_length", "multiscale"})
 THINKING_GUARDS = ("max_steps_per_round", "max_round_seconds", "max_rollout_tokens", "fallback_to_plain")
-AGENT_GUARDS = ("finalization_reserve_seconds", "audit_patch_timeout_seconds", "verification_reminder")
+AGENT_GUARDS = ("finalization_reserve_seconds", "finalization_reserve_steps", "audit_patch_timeout_seconds", "verification_reminder")
 
 
 def _omit_disabled_guards(payload: dict[str, Any], names: Sequence[str]) -> None:
@@ -161,12 +161,15 @@ class AgentConfig:
     context_safety_tokens: int = 256
     max_consecutive_format_errors: int = 1
     finalization_reserve_seconds: int = 0
-    audit_patch_timeout_seconds: int = 0
+    finalization_reserve_steps: int = 5
+    audit_patch_timeout_seconds: int = 10
     verification_reminder: bool = False
 
     def __post_init__(self) -> None:
         _positive("agent.step_limit", self.step_limit)
         _positive("agent.max_consecutive_format_errors", self.max_consecutive_format_errors)
+        if self.finalization_reserve_steps < 0:
+            raise ValueError("finalization reserve steps must be non-negative")
         if self.finalization_reserve_seconds < 0 or (
             self.finalization_reserve_seconds
             and self.finalization_reserve_seconds >= self.wall_time_limit_seconds
@@ -468,7 +471,8 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             context_safety_tokens=int(agent.get("context_safety_tokens", 256)),
             max_consecutive_format_errors=int(agent.get("max_consecutive_format_errors", 1)),
             finalization_reserve_seconds=int(agent.get("finalization_reserve_seconds", 0)),
-            audit_patch_timeout_seconds=int(agent.get("audit_patch_timeout_seconds", 0)),
+            finalization_reserve_steps=int(agent.get("finalization_reserve_steps", 5)),
+            audit_patch_timeout_seconds=int(agent.get("audit_patch_timeout_seconds", 10)),
             verification_reminder=bool(agent.get("verification_reminder", False)),
         ),
         budget=BudgetConfig(

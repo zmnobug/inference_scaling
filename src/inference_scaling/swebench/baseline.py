@@ -98,6 +98,11 @@ def run_budgeted_baseline(session, experiment, runtime, *, decision_sampler=None
             )
             if remaining_time <= 0:
                 raise BaselineDeadline()
+            if session.agent.n_calls >= config.step_limit:
+                stop("agent_step_limit")
+                break
+            if hasattr(session, "prepare_step_finalization"):
+                session.prepare_step_finalization()
             finalizing = bool(reserve and remaining_time <= reserve)
             if finalizing and not diagnostics.get("finalization"):
                 diagnostics["finalization"] = {"remaining_seconds": remaining_time, "mode": "ordinary_generation"}
@@ -123,9 +128,6 @@ def run_budgeted_baseline(session, experiment, runtime, *, decision_sampler=None
             )
             if remaining_context <= 0:
                 stop("context_budget_exhausted")
-                break
-            if session.agent.n_calls >= config.step_limit:
-                stop("agent_step_limit")
                 break
             max_tokens = min(session.chunk_tokens, remaining_output, remaining_context)
             request_record = {

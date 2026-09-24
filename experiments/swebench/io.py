@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import importlib.metadata
 import json
 import subprocess
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -26,6 +28,62 @@ def atomic_write_json(path: Path, payload: Any) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def externalize_sampling_details(directory: Path, record: dict[str, Any]) -> None:
+    details = record.get("diagnostics", {}).get("thinking_is")
+    if not details or "details_path" in details:
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=directory, suffix=".json.gz.tmp", delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        with gzip.open(temporary, "wt", encoding="utf-8", compresslevel=3) as handle:
+            json.dump(details, handle, ensure_ascii=False, separators=(",", ":"))
+        checksum = _file_sha256(temporary)
+        filename = f"thinking_is.{checksum}.json.gz"
+        temporary.replace(directory / filename)
+    finally:
+        temporary.unlink(missing_ok=True)
+    record["diagnostics"]["thinking_is"] = {
+        **{key: value for key, value in details.items() if key not in {"requests", "rounds"}},
+        "request_count": len(details.get("requests", [])),
+        "round_count": len(details.get("rounds", [])),
+        "details_path": filename,
+        "details_sha256": checksum,
+        "details_encoding": "gzip-json",
+    }
+
+
+def _sampling_details_path(path: Path, record: Mapping[str, Any]) -> Path | None:
+    details = record.get("diagnostics", {}).get("thinking_is", {})
+    filename = details.get("details_path")
+    if filename is None:
+        return None
+    if Path(filename).name != filename or details.get("details_encoding") != "gzip-json":
+        raise ValueError("invalid sampling diagnostics reference")
+    artifact = path.parent / filename
+    if _file_sha256(artifact) != details.get("details_sha256"):
+        raise ValueError("sampling diagnostics checksum mismatch")
+    return artifact
+
+
+def load_record(path: Path, *, include_sampling_details: bool = False) -> dict[str, Any]:
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if include_sampling_details:
+        artifact = _sampling_details_path(path, record)
+        if artifact is not None:
+            with gzip.open(artifact, "rt", encoding="utf-8") as handle:
+                record["diagnostics"]["thinking_is"] = json.load(handle)
+    return record
 
 
 def sha256_json(payload: Any) -> str:
@@ -72,7 +130,8 @@ def existing_record_matches(
         return False
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        _sampling_details_path(path, record)
+    except (OSError, ValueError):
         return False
     return (
         record.get("schema_version") == RESULT_SCHEMA_VERSION
