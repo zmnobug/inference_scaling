@@ -3,8 +3,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from inference_scaling.swebench.config import BudgetConfig, ExperimentArm
-from inference_scaling.swebench.miniagent import MiniAgentSessionFactory
+from inference_scaling.swebench.miniagent import (
+    ExperimentBudgetExceeded,
+    MiniAgentSessionFactory,
+)
 from inference_scaling.swebench.runner import _run_conditional_is, _run_mh_chain
 from inference_scaling.swebench.runner import run_experiment_arm
 from inference_scaling.swebench.runner import capture_workspace_patch
@@ -80,6 +85,9 @@ class FakeSession:
     def close(self) -> None:
         self.closed = True
 
+    def serialize(self):
+        return {"decisions": [item.to_dict() for item in self.executed]}
+
 
 class FakeFactory:
     def __init__(self, *, terminal_after: int = 1) -> None:
@@ -141,6 +149,7 @@ def test_is_promotes_checkpointed_candidate_without_double_counting(
     assert selected.trajectory_logprob == -1.0
     assert diagnostics["steps"][0]["rollout_logprobs"] == [[-1.0], [-3.0]]
     assert factory.main.closed is True
+    assert factory.active_session is selected
     assert len(factory.discarded) == 2
 
 
@@ -250,6 +259,7 @@ def test_mh_proposal_starts_from_cut_checkpoint_without_replay() -> None:
     assert factory.proposal_checkpoint.executed == []
     assert diagnostics["trace"][0]["cut"] == 0
     assert diagnostics["trace"][0]["accepted"] is True
+    assert factory.active_session is selected
 
 
 def test_cleanup_failure_preserves_completed_result(monkeypatch) -> None:
@@ -373,3 +383,99 @@ def test_aborted_run_captures_audit_before_cleanup_without_submitting(monkeypatc
     assert record["submission"] == ""
     assert record["exit_status"] == "generation_timeout"
     assert record["diagnostics"]["workspace_audit"]["tracked_patch"] == "unsubmitted diff"
+
+
+@pytest.mark.parametrize("method", ["base", "is", "mh"])
+@pytest.mark.parametrize("failure_type", [RuntimeError, ExperimentBudgetExceeded])
+def test_interrupted_runner_preserves_main_session_before_cleanup(
+    monkeypatch, method, failure_type,
+):
+    events = []
+    session = FakeSession([FakeExecuted(FakeDecision(-1.0, "prior-action"))])
+    experiment = SimpleNamespace(
+        budget=BudgetConfig(10, 0, 0, 10, 60), fingerprint="config",
+        api=SimpleNamespace(model_name="test"),
+        agent=SimpleNamespace(context_window=0, audit_patch_timeout_seconds=10),
+    )
+
+    def fail(*args, **kwargs):
+        raise failure_type("injected failure after prior action")
+
+    class Factory:
+        runtime = {"fingerprint": "runtime"}
+
+        def create(self, *args):
+            return session
+
+        def checkpoint(self, current):
+            fail()
+
+        def close_all(self):
+            events.append("cleanup")
+            session.close()
+            return []
+
+    factory = Factory()
+    factory.experiment = experiment
+    monkeypatch.setattr(session, "run_to_end", fail)
+    monkeypatch.setattr("inference_scaling.swebench.runner._sample_decision", fail)
+    monkeypatch.setattr(
+        "inference_scaling.swebench.runner.MiniAgentSessionFactory", lambda *args, **kwargs: factory,
+    )
+    monkeypatch.setattr("inference_scaling.swebench.runner.miniagent_manifest", lambda *args: {})
+
+    def audit(current, timeout):
+        assert current is session and not session.closed
+        events.append("audit")
+        return {"tracked_patch": "audit-only diff"}
+
+    monkeypatch.setattr("inference_scaling.swebench.runner.capture_workspace_patch", audit)
+    parameters = {"method": method, "chunk_tokens": 64}
+    if method == "is":
+        parameters.update(candidate_count=2, rollout_count=1)
+    elif method == "mh":
+        parameters.update(updates_per_chain=1, suffix_schedule="full", chains=1)
+    record = run_experiment_arm(
+        experiment, {"instance_id": "test"}, ExperimentArm(**parameters), 7,
+    )
+
+    assert events == ["audit", "cleanup"]
+    assert record["status"] == ("budget_exceeded" if failure_type is ExperimentBudgetExceeded else "error")
+    assert record["exit_status"] == failure_type.__name__
+    assert record["trajectory"] == session.serialize()
+    assert record["trajectory"]["decisions"][0]["request_id"] == "prior-action"
+    assert record["submission"] == ""
+    assert record["error"]["message"] == "injected failure after prior action"
+
+
+def test_failed_mh_proposal_recovers_incumbent_not_proposal(monkeypatch):
+    experiment = SimpleNamespace(
+        budget=BudgetConfig(100, 0, 0, 100, 60), fingerprint="config",
+        api=SimpleNamespace(model_name="test"),
+        agent=SimpleNamespace(audit_patch_timeout_seconds=0),
+    )
+    factory = FakeMHFactory()
+    factory.runtime = {"fingerprint": "runtime"}
+    factory.initial._terminal = True
+    proposal = FakeMHSession(next_decision=FakeDecision(-2.0, "speculative"))
+
+    def fail():
+        raise RuntimeError("proposal failed")
+
+    monkeypatch.setattr(proposal, "sample_decision", fail)
+    monkeypatch.setattr(factory, "create_from_checkpoint", lambda *args, **kwargs: proposal)
+    factory.close_all = lambda: (factory.initial.close() or [])
+    monkeypatch.setattr(
+        "inference_scaling.swebench.runner.MiniAgentSessionFactory", lambda *args, **kwargs: factory,
+    )
+    monkeypatch.setattr("inference_scaling.swebench.runner.miniagent_manifest", lambda *args: {})
+    arm = ExperimentArm(method="mh", chunk_tokens=64, updates_per_chain=1, suffix_schedule="full", chains=1)
+
+    record = run_experiment_arm(experiment, {"instance_id": "test"}, arm, 7)
+
+    assert record["status"] == "error"
+    assert record["trajectory"] == factory.initial.serialize()
+    assert record["trajectory"]["decisions"][0]["request_id"] == "old"
+    assert record["diagnostics"]["recovered_session"]["exit_status"] == "Submitted"
+    assert record["submission"] == ""
+    assert factory.initial.closed and proposal.closed

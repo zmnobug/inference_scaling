@@ -8,7 +8,12 @@ from typing import cast
 
 import pytest
 
-from experiments.swebench.io import existing_record_matches, rebuild_predictions, load_record
+from experiments.swebench.io import (
+    existing_record_matches,
+    rebuild_predictions,
+    load_record,
+    record_matches_experiment,
+)
 from experiments.swebench.run_suite import _write_result
 from inference_scaling.swebench.config import (
     ExperimentArm,
@@ -87,6 +92,57 @@ def test_resume_requires_matching_runtime_fingerprint(tmp_path: Path) -> None:
     path.write_text(json.dumps(previous))
     assert not existing_record_matches(
         path, experiment, arm, 7, instance, runtime_fingerprint="runtime-a"
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    ["schema_version", "config_fingerprint", "arm_fingerprint",
+     "instance_fingerprint", "runtime_fingerprint", "seed"],
+)
+def test_prediction_export_excludes_incompatible_records(tmp_path, changed_field):
+    instance = {"instance_id": "case", "problem_statement": "problem"}
+    arm = ExperimentArm(method="base", chunk_tokens=64)
+    experiment = SimpleNamespace(fingerprint="config")
+    seed_root = tmp_path / "base/seed-7"
+    record = {
+        "instance_id": "case", "model_name_or_path": "model", "submission": "patch",
+        "schema_version": RESULT_SCHEMA_VERSION, "config_fingerprint": "config",
+        "arm_fingerprint": arm.fingerprint,
+        "instance_fingerprint": instance_fingerprint(instance),
+        "runtime_fingerprint": "runtime", "seed": 7, "status": "completed",
+    }
+    path = seed_root / "instances/case/record.json"
+    _record(path, "case")
+    path.write_text(json.dumps(record))
+
+    def matches(current, current_arm, seed):
+        return record_matches_experiment(
+            current, experiment, current_arm, seed, instance,
+            runtime_fingerprint="runtime",
+        )
+
+    rebuild_predictions(tmp_path, (arm,), (7,), ("case",), record_validator=matches)
+    assert json.loads((seed_root / "preds.json").read_text())["case"]["model_patch"] == "patch"
+    record[changed_field] = "stale"
+    path.write_text(json.dumps(record))
+    rebuild_predictions(tmp_path, (arm,), (7,), ("case",), record_validator=matches)
+    assert json.loads((seed_root / "preds.json").read_text()) == {}
+
+
+@pytest.mark.parametrize("status", ["completed", "budget_exceeded", "error"])
+def test_record_identity_does_not_discard_failed_cases(status):
+    instance = {"instance_id": "case"}
+    arm = ExperimentArm(method="base", chunk_tokens=64)
+    record = {
+        "schema_version": RESULT_SCHEMA_VERSION, "config_fingerprint": "config",
+        "arm_fingerprint": arm.fingerprint,
+        "instance_fingerprint": instance_fingerprint(instance),
+        "runtime_fingerprint": "runtime", "seed": 7, "status": status,
+    }
+    assert record_matches_experiment(
+        record, SimpleNamespace(fingerprint="config"), arm, 7, instance,
+        runtime_fingerprint="runtime",
     )
 
 

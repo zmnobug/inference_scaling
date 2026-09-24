@@ -1220,6 +1220,7 @@ class MiniAgentSessionFactory:
         self.instance = dict(instance)
         self.ledger = ledger
         self._sessions: list[MiniAgentSession] = []
+        self.active_session: MiniAgentSession | None = None
         self.environment_checks: list[dict[str, Any]] = []
         self._snapshot_namespace = uuid.uuid4().hex
         self._snapshot_counter = 0

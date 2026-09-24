@@ -53,6 +53,29 @@ Both options participate in configuration fingerprints. Old configurations that
 omit them now resolve to these new defaults; historical reproduction requires the
 historical source/configuration rather than silently reusing old result folders.
 
+On an exception or experiment-budget exhaustion, Base, IS, and MH preserve the
+current main/incumbent session's trajectory and audit before cleanup, even when
+the internal runner has not returned. Speculative rollout/proposal sessions are
+not substituted for the main session. Recovered sessions are diagnostic only:
+their patches are not promoted to official submissions after an interrupted run.
+
+## Reruns and evaluation identity
+
+`--redo` repeats jobs within the same experiment identity. It does not bypass
+manifest compatibility checks: changes to the configuration, dataset selection,
+arms, seeds, schema, or serving identity require a new tag or output directory.
+Prediction export from the suite checks each record's schema, configuration,
+arm, instance, seed, and runtime fingerprints. Incompatible records are excluded;
+the evaluator rejects incomplete prediction sets rather than scoring mixed runs.
+Matching failed records remain included so failures are not removed from the
+evaluation denominator.
+
+Official evaluator run IDs include a digest of the predictions, dataset snapshot,
+and split. Identical inputs can reuse their cache; changed patches or evaluation
+data cannot reuse an old run's reports. Historical run IDs without this digest
+are not reused. The normalized `evaluation/reports/<arm>/seed-<seed>.json` paths
+remain unchanged.
+
 ## Sampling diagnostics storage
 
 Full Thinking IS diagnostics are stored losslessly in
