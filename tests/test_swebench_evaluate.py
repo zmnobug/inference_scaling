@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from experiments.swebench import evaluate
 
 
@@ -60,7 +62,7 @@ def test_evaluator_normalizes_report_and_writes_summary(
         "prepare_evaluation_dataset",
         lambda **kwargs: (
             tmp_path / "dataset.parquet",
-            {"mode": "native_swebench_5_dataset"},
+            {"mode": "native_swebench_5_dataset", "sha256": "snapshot-hash"},
         ),
     )
     _write(
@@ -78,8 +80,10 @@ def test_evaluator_normalizes_report_and_writes_summary(
     def fake_run(command, *, cwd, check):
         assert check is True
         assert "swebench.harness.run_evaluation" in command
+        run_id = command[command.index("--run_id") + 1]
+        assert run_id.startswith("inference-scaling-base-seed7-input-")
         _write(
-            Path(cwd) / "openai__model.inference-scaling-base-seed7.json",
+            Path(cwd) / f"openai__model.{run_id}.json",
             {
                 "total_instances": 1,
                 "resolved_instances": 1,
@@ -137,7 +141,7 @@ def test_evaluator_dry_run_does_not_write_artifacts(
         "prepare_evaluation_dataset",
         lambda **kwargs: (
             tmp_path / "dataset.parquet",
-            {"mode": "native_swebench_5_dataset"},
+            {"mode": "native_swebench_5_dataset", "sha256": "snapshot-hash"},
         ),
     )
     monkeypatch.setattr(
@@ -157,3 +161,62 @@ def test_evaluator_dry_run_does_not_write_artifacts(
 
     assert not (tmp_path / "evaluation").exists()
     assert not (tmp_path / "evaluation_summary.json").exists()
+
+
+@pytest.mark.parametrize("changed_input", ["patch", "dataset", "split"])
+def test_evaluation_cache_is_bound_to_inputs(tmp_path, monkeypatch, changed_input):
+    manifest = {
+        "dataset": {"split": "test", "instance_ids": ["instance"]},
+        "arms": [{"tag": "base"}],
+        "seeds": [7],
+    }
+    predictions = {
+        "instance": {
+            "instance_id": "instance",
+            "model_name_or_path": "openai/model",
+            "model_patch": "old patch",
+        }
+    }
+    predictions_path = tmp_path / "base/seed-7/preds.json"
+    snapshot = tmp_path / "dataset.parquet"
+    _write(tmp_path / "manifest.json", manifest)
+    _write(predictions_path, predictions)
+    snapshot.write_bytes(b"original dataset")
+    monkeypatch.setattr(
+        evaluate, "prepare_evaluation_dataset",
+        lambda **kwargs: (snapshot, {"sha256": evaluate.sha256_file(snapshot)}),
+    )
+    monkeypatch.setattr(evaluate, "summarize_evaluations", lambda root: {})
+    monkeypatch.setattr(sys, "argv", ["evaluate", "--results", str(tmp_path)])
+    executions = []
+    run_ids = []
+
+    def fake_harness(command, *, cwd, check):
+        run_id = command[command.index("--run_id") + 1]
+        run_ids.append(run_id)
+        report_path = Path(cwd) / f"openai__model.{run_id}.json"
+        if report_path.exists():
+            return
+        executions.append(run_id)
+        _write(report_path, {"submitted_ids": ["instance"], "execution": len(executions)})
+
+    monkeypatch.setattr(evaluate.subprocess, "run", fake_harness)
+    evaluate.main()
+    evaluate.main()
+    assert len(executions) == 1
+    assert run_ids[0] == run_ids[1]
+
+    if changed_input == "patch":
+        predictions["instance"]["model_patch"] = "new patch"
+        _write(predictions_path, predictions)
+    elif changed_input == "dataset":
+        snapshot.write_bytes(b"updated evaluation script")
+    else:
+        manifest["dataset"]["split"] = "dev"
+        _write(tmp_path / "manifest.json", manifest)
+    evaluate.main()
+
+    assert len(executions) == 2
+    assert run_ids[-1] != run_ids[0]
+    normalized = tmp_path / "evaluation/reports/base/seed-7.json"
+    assert json.loads(normalized.read_text())["execution"] == 2
