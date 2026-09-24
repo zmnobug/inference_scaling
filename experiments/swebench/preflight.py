@@ -35,7 +35,13 @@ def main() -> None:
     parser.add_argument("--skip-api", action="store_true")
     parser.add_argument("--skip-docker", action="store_true")
     parser.add_argument("--skip-dataset", action="store_true")
+    parser.add_argument(
+        "--task-instance", action="append", default=[],
+        help="probe a real task container's interpreter and imports; repeat for multiple IDs",
+    )
     args = parser.parse_args()
+    if args.task_instance and (args.skip_dataset or args.skip_docker):
+        parser.error("--task-instance requires dataset and container checks")
 
     if sys.version_info < (3, 11):
         raise RuntimeError("Python 3.11 or newer is required")
@@ -95,6 +101,27 @@ def main() -> None:
             "rows": len(dataset),
             "fingerprint": getattr(dataset, "_fingerprint", ""),
         }
+
+    checks["task_environments"] = []
+    if args.task_instance:
+        from minisweagent.config import get_config_from_spec
+        from minisweagent.run.benchmarks.swebench import get_sb_environment
+
+        from inference_scaling.swebench.task_environment import verify_task_environment
+
+        selected = {item["instance_id"]: item for item in instances}
+        missing = set(args.task_instance) - selected.keys()
+        if missing:
+            parser.error(f"unknown task instance IDs: {sorted(missing)}")
+        config = get_config_from_spec(experiment.run.miniagent_config)
+        config.setdefault("environment", {})["environment_class"] = experiment.run.environment_class
+        for instance_id in dict.fromkeys(args.task_instance):
+            instance = selected[instance_id]
+            environment = get_sb_environment(config, instance)
+            try:
+                checks["task_environments"].append(verify_task_environment(environment, instance))
+            finally:
+                environment.cleanup()
 
     if not args.skip_api:
         from inference_scaling.swebench.miniagent import (

@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import random
+import subprocess
 import time
 import traceback
 from dataclasses import asdict
@@ -42,7 +43,7 @@ except ImportError as exc:  # pragma: no cover - target preflight reports this
     raise ImportError("mini-swe-agent is required for SWE-bench runs") from exc
 
 
-RESULT_SCHEMA_VERSION = "swebench-is-mh-v5"
+RESULT_SCHEMA_VERSION = "swebench-is-mh-v7"
 
 
 def derive_seed(seed: int, *parts: object) -> int:
@@ -451,6 +452,34 @@ def _run_mh(
     }
 
 
+def capture_workspace_patch(session, timeout_seconds: int) -> dict[str, Any]:
+    started = time.monotonic()
+    audit: dict[str, Any] = {"purpose": "audit_only", "official_submission_unchanged": True,
+                             "untracked_contents_saved": False}
+    try:
+        environment = session.environment
+        if not environment.container_id:
+            raise ValueError("workspace audit requires a live Docker container")
+        prefix = [environment.executable, "exec", environment.container_id, "git", "-C", "/testbed"]
+        for label, arguments in (
+            ("tracked_patch", ["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--"]),
+            ("untracked_files", ["ls-files", "--others", "--exclude-standard"]),
+        ):
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("workspace audit deadline exhausted")
+            result = subprocess.run(prefix + arguments, capture_output=True, timeout=remaining, check=False)
+            audit[label + "_returncode"] = result.returncode
+            audit[label] = result.stdout[:1024 * 1024].decode("utf-8", errors="replace")
+            audit[label + "_truncated"] = len(result.stdout) > 1024 * 1024
+            if result.returncode:
+                audit[label + "_stderr"] = result.stderr[:4000].decode("utf-8", errors="replace")
+    except Exception as exc:
+        audit["error"] = {"type": type(exc).__name__, "message": str(exc)}
+    audit["elapsed_seconds"] = time.monotonic() - started
+    return audit
+
+
 def run_experiment_arm(
     experiment: ExperimentConfig,
     instance: Mapping[str, Any],
@@ -521,7 +550,11 @@ def run_experiment_arm(
             exit_status = session.exit_status or type(exc).__name__
             trajectory = session.serialize()
     finally:
+        audit_timeout = getattr(getattr(experiment, "agent", None), "audit_patch_timeout_seconds", 0)
+        if audit_timeout and session is not None and session.exit_status != "Submitted":
+            diagnostics["workspace_audit"] = capture_workspace_patch(session, audit_timeout)
         if factory is not None:
+            diagnostics["task_environment"] = getattr(factory, "environment_checks", [])
             cleanup_errors = factory.close_all()
             if cleanup_errors:
                 if error is None:

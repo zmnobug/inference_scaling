@@ -8,6 +8,7 @@ import pytest
 
 from inference_scaling.swebench import baseline
 from inference_scaling.swebench.config import load_experiment_config
+from inference_scaling.swebench.miniagent import MiniAgentSession
 
 
 class FakeSession:
@@ -70,6 +71,49 @@ def test_dynamic_limit_and_complete_length_response(experiment):
     assert 0 < session.kwargs["timeout"] <= 10
     assert session.applied == 1
     assert result["termination_reason"] == "Submitted"
+
+
+def test_step_reserve_warns_once_without_changing_is_sampler_or_budget(experiment):
+    experiment.agent.wall_time_limit_seconds = 0
+    experiment.agent.step_limit = 250
+    session = FakeSession()
+    session.agent.config = SimpleNamespace(step_limit=250)
+    session.agent.n_calls = 245
+    session.finalization_reserve_steps = 5
+    session.prepare_step_finalization = lambda: MiniAgentSession.prepare_step_finalization(session)
+    sampled_messages = []
+
+    def sample(messages, maximum, deadline):
+        assert math.isinf(deadline)
+        sampled_messages.append(list(messages))
+        return session.decision
+
+    def apply(decision):
+        session.agent.n_calls += 1
+
+    session.apply_decision = apply
+    result = baseline.run_budgeted_baseline(session, experiment, {}, decision_sampler=sample)
+    assert len(sampled_messages) == 5
+    assert "Only 5 model calls remain" in sampled_messages[0][-1]["content"]
+    assert sum(message.get("extra", {}).get("step_finalization", False) for message in session.agent.messages) == 1
+    assert session.agent.n_calls == 250
+    assert result["termination_reason"] == "agent_step_limit"
+    assert not session.kwargs
+
+
+def test_step_reserve_does_not_warn_early_or_duplicate_restored_reminder(experiment):
+    session = FakeSession()
+    session.agent.config = SimpleNamespace(step_limit=250)
+    session.finalization_reserve_steps = 5
+    session.agent.n_calls = 244
+    MiniAgentSession.prepare_step_finalization(session)
+    assert not session.agent.messages
+    session.agent.n_calls = 245
+    MiniAgentSession.prepare_step_finalization(session)
+    saved_messages = list(session.agent.messages)
+    session.agent.messages = saved_messages
+    MiniAgentSession.prepare_step_finalization(session)
+    assert len(session.agent.messages) == 1
 
 
 @pytest.mark.parametrize(
