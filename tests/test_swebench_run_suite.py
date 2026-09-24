@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import sys
+import json
+
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,8 +30,9 @@ def test_instance_batch_advances_past_completed_instances() -> None:
     assert [instance["instance_id"] for instance in selected] == ["two", "four"]
 
 
+@pytest.mark.parametrize("previous_schema", [None, "swebench-is-mh-v5"])
 def test_dry_run_does_not_write_result_artifacts(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, previous_schema
 ) -> None:
     experiment = SimpleNamespace(
         path=tmp_path / "config.toml",
@@ -59,6 +63,7 @@ def test_dry_run_does_not_write_result_artifacts(
         run_suite,
         "build_manifest",
         lambda **kwargs: {
+            "schema_version": "swebench-is-mh-v7",
             "config_fingerprint": "config",
             "dataset": {},
             "arms": [],
@@ -89,6 +94,17 @@ def test_dry_run_does_not_write_result_artifacts(
         ],
     )
 
-    run_suite.main()
-
-    assert not output.exists()
+    if previous_schema:
+        (output / experiment.run.tag).mkdir(parents=True)
+        previous = {
+            "schema_version": previous_schema, "config_fingerprint": "config",
+            "dataset": {}, "arms": [], "seeds": [7],
+        }
+        manifest_path = output / experiment.run.tag / "manifest.json"
+        manifest_path.write_text(json.dumps(previous))
+        with pytest.raises(RuntimeError, match="choose a new tag or output directory"):
+            run_suite.main()
+        assert json.loads(manifest_path.read_text()) == previous
+    else:
+        run_suite.main()
+        assert not output.exists()

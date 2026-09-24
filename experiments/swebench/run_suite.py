@@ -18,6 +18,7 @@ from experiments.swebench.io import (
     atomic_write_json,
     build_manifest,
     existing_record_matches,
+    externalize_sampling_details,
     rebuild_predictions,
     result_directory,
 )
@@ -129,6 +130,7 @@ def _select_incomplete_instance_batch(
 
 
 def _write_result(directory: Path, record: dict[str, Any]) -> None:
+    externalize_sampling_details(directory, record)
     trajectory = record.pop("trajectory", None)
     if trajectory is not None:
         atomic_write_json(directory / "trajectory.json", trajectory)
@@ -214,7 +216,7 @@ def main() -> None:
     manifest_path = output_root / "manifest.json"
     if manifest_path.exists() and not args.redo:
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        comparable_keys = ["config_fingerprint", "dataset", "arms", "seeds"]
+        comparable_keys = ["schema_version", "config_fingerprint", "dataset", "arms", "seeds"]
         if runtime_fingerprint is not None:
             comparable_keys.append("model")
         if any(previous.get(key) != manifest.get(key) for key in comparable_keys):

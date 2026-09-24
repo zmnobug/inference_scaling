@@ -94,6 +94,7 @@ def _bare_session(
     session.environment = cast(Any, SimpleNamespace())
     session.chunk_tokens = chunk_tokens
     session.max_trajectory_output_tokens = max_tokens
+    session.finalization_reserve_steps = 0
     session.executed = []
     session.closed = False
     session.initial_digest = "test"
@@ -404,7 +405,7 @@ def test_checkpoint_restore_starts_from_the_protected_image_tag(
         "run": {"env_startup_command": "initialize"},
     }
     factory.ledger = _ledger()
-    monkeypatch.setattr(factory, "_create_session", lambda *args: session)
+    monkeypatch.setattr(factory, "_create_session", lambda *args, **kwargs: session)
     checkpoint = cast(
         SessionCheckpoint,
         SimpleNamespace(

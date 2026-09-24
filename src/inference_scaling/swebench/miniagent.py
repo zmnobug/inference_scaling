@@ -15,6 +15,14 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
 from inference_scaling.swebench.config import ExperimentConfig
+from inference_scaling.swebench.submission import submission_error
+from inference_scaling.swebench.task_environment import (
+    TASK_ENVIRONMENT_GUIDANCE,
+    TASK_ENVIRONMENT_PROTOCOL,
+    TaskEnvironmentError,
+    activate_task_command,
+    verify_task_environment,
+)
 
 try:
     from minisweagent import __version__ as miniagent_version
@@ -204,10 +212,15 @@ class BudgetLedger:
 class BudgetedEnvironment:
     """Transparent MiniAgent environment wrapper that accounts for commands."""
 
-    def __init__(self, environment, ledger: BudgetLedger) -> None:
+    def __init__(
+        self, environment, ledger: BudgetLedger,
+        *, task_environment: dict[str, Any] | None = None,
+    ) -> None:
         self._environment = environment
         self._ledger = ledger
         self.config = environment.config
+        self.task_environment = task_environment
+        self.submission_checks: list[dict[str, Any]] = []
 
     def execute(
         self, action: dict[str, Any], cwd: str = "", **kwargs: Any
@@ -215,11 +228,35 @@ class BudgetedEnvironment:
         self._ledger.start_tool_call()
         started = time.monotonic()
         try:
+            if self.task_environment is not None:
+                action = {**action, "command": activate_task_command(action.get("command", ""))}
             result = self._environment.execute(action, cwd=cwd, **kwargs)
-        except InterruptAgentFlow:
+        except InterruptAgentFlow as exc:
             self._ledger.finish_tool_call(
                 time.monotonic() - started, failed=False
             )
+            if self.task_environment is not None:
+                for message in exc.messages:
+                    extra = message.get("extra", {})
+                    if extra.get("exit_status") != "Submitted":
+                        continue
+                    patch = str(extra.get("submission", ""))
+                    error = submission_error(patch)
+                    self.submission_checks.append({
+                        "valid_syntax": error is None, "error": error,
+                        "submission_sha256": hashlib.sha256(patch.encode()).hexdigest(),
+                        "submission_bytes": len(patch.encode()),
+                    })
+                    if error:
+                        return {
+                            "returncode": 1, "exception_info": "",
+                            "output": (
+                                f"Submission rejected: {error}\n"
+                                "The task is not submitted. Inspect git diff HEAD from /testbed, "
+                                "verify the change if possible, and submit only the actual diff. "
+                                "Do not invent a patch or claim tests passed. Existing budgets still apply."
+                            ),
+                        }
             raise
         except Exception:
             self._ledger.finish_tool_call(
@@ -234,6 +271,11 @@ class BudgetedEnvironment:
 
     def serialize(self):
         payload = self._environment.serialize()
+        if self.task_environment is not None:
+            payload.setdefault("info", {}).setdefault("runtime", {})[
+                "task_environment"
+            ] = copy.deepcopy(self.task_environment)
+            payload["info"]["runtime"]["submission_checks"] = copy.deepcopy(self.submission_checks)
         container_id = getattr(self._environment, "container_id", None)
         executable = getattr(self.config, "executable", "docker")
         if container_id:
@@ -917,6 +959,7 @@ class MiniAgentSession:
         *,
         chunk_tokens: int = 256,
         max_trajectory_output_tokens: int = 8192,
+        finalization_reserve_steps: int = 0,
     ) -> None:
         if chunk_tokens <= 0:
             raise ValueError("chunk_tokens must be positive")
@@ -926,6 +969,7 @@ class MiniAgentSession:
         self.environment = environment
         self.chunk_tokens = int(chunk_tokens)
         self.max_trajectory_output_tokens = int(max_trajectory_output_tokens)
+        self.finalization_reserve_steps = finalization_reserve_steps
         self.executed: list[ExecutedDecision] = []
         self.closed = False
         self.agent.extra_template_vars |= {"task": task}
@@ -975,6 +1019,24 @@ class MiniAgentSession:
             }
         )
 
+    def prepare_step_finalization(self) -> None:
+        remaining = self.agent.config.step_limit - self.agent.n_calls
+        if self.terminal or not 0 < remaining <= self.finalization_reserve_steps:
+            return
+        if any(message.get("extra", {}).get("step_finalization") for message in self.agent.messages):
+            return
+        self.agent.add_messages({
+            "role": "user",
+            "content": (
+                f"Only {remaining} model calls remain before the task's step limit. "
+                "Stop broad exploration. Inspect the current diff, perform focused verification "
+                "if feasible, and submit the actual patch using COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT. "
+                "Do not substitute explanatory text for a patch or claim unrun tests passed. "
+                "This reminder does not extend any budget."
+            ),
+            "extra": {"step_finalization": True},
+        })
+
     def can_query(self) -> bool:
         if self.terminal:
             return False
@@ -993,6 +1055,7 @@ class MiniAgentSession:
         ):
             self._append_limit_exit("TimeExceeded")
             return False
+        self.prepare_step_finalization()
         return True
 
     def sample_decision(self) -> SampledDecision:
@@ -1157,6 +1220,7 @@ class MiniAgentSessionFactory:
         self.instance = dict(instance)
         self.ledger = ledger
         self._sessions: list[MiniAgentSession] = []
+        self.environment_checks: list[dict[str, Any]] = []
         self._snapshot_namespace = uuid.uuid4().hex
         self._snapshot_counter = 0
         self._snapshot_images: list[tuple[str, str, str]] = []
@@ -1174,6 +1238,9 @@ class MiniAgentSessionFactory:
         if experiment.agent.wall_time_limit_seconds == 0 and experiment.run.environment_class == "docker":
             self.mini_config["environment"]["container_timeout"] = "infinity"
         agent_config = self.mini_config.setdefault("agent", {})
+        agent_config["system_template"] = (
+            agent_config.get("system_template", "") + "\n\n" + TASK_ENVIRONMENT_GUIDANCE
+        )
         agent_config["step_limit"] = experiment.agent.step_limit
         agent_config["cost_limit"] = experiment.agent.cost_limit
         agent_config["wall_time_limit_seconds"] = (
@@ -1217,8 +1284,18 @@ class MiniAgentSessionFactory:
         namespace: str,
         seed: int,
         chunk_tokens: int,
+        *,
+        restored: bool = False,
     ) -> MiniAgentSession:
-        environment = BudgetedEnvironment(raw_environment, self.ledger)
+        try:
+            check = verify_task_environment(raw_environment, self.instance, restored=restored)
+        except TaskEnvironmentError as error:
+            self.environment_checks.append(error.diagnostics)
+            raise
+        self.environment_checks.append(check)
+        environment = BudgetedEnvironment(
+            raw_environment, self.ledger, task_environment=check
+        )
         model = self.make_model(namespace, seed, chunk_tokens)
         agent = DefaultAgent(model, environment, **self.mini_config.get("agent", {}))
         session = MiniAgentSession(
@@ -1229,6 +1306,7 @@ class MiniAgentSessionFactory:
             max_trajectory_output_tokens=(
                 self.experiment.agent.max_trajectory_output_tokens
             ),
+            finalization_reserve_steps=self.experiment.agent.finalization_reserve_steps,
         )
         self._sessions = [item for item in self._sessions if not item.closed]
         self._sessions.append(session)
@@ -1236,9 +1314,16 @@ class MiniAgentSessionFactory:
 
     def create(self, namespace: str, seed: int, chunk_tokens: int) -> MiniAgentSession:
         raw_environment = get_sb_environment(self.mini_config, self.instance)
-        return self._create_session(
-            raw_environment, namespace, seed, chunk_tokens
-        )
+        try:
+            return self._create_session(
+                raw_environment, namespace, seed, chunk_tokens
+            )
+        except Exception as error:
+            try:
+                raw_environment.cleanup()
+            except Exception as cleanup_error:
+                error.add_note(f"task environment cleanup failed: {cleanup_error}")
+            raise
 
     def checkpoint(self, session: MiniAgentSession) -> SessionCheckpoint:
         if session.closed:
@@ -1293,9 +1378,16 @@ class MiniAgentSessionFactory:
             config = copy.deepcopy(self.mini_config)
             config.setdefault("run", {}).pop("env_startup_command", None)
             raw_environment = get_sb_environment(config, instance)
-            session = self._create_session(
-                raw_environment, namespace, seed, chunk_tokens
-            )
+            try:
+                session = self._create_session(
+                    raw_environment, namespace, seed, chunk_tokens, restored=True
+                )
+            except Exception as error:
+                try:
+                    raw_environment.cleanup()
+                except Exception as cleanup_error:
+                    error.add_note(f"task environment cleanup failed: {cleanup_error}")
+                raise
             session.restore_checkpoint(
                 checkpoint,
                 restore_model_request_index=restore_model_request_index,
@@ -1394,5 +1486,6 @@ def miniagent_manifest(experiment: ExperimentConfig) -> dict[str, Any]:
             experiment.agent.max_trajectory_output_tokens
         ),
         "branch_state_mode": "docker_tagged_commit_checkpoint_v2",
+        "task_environment_protocol": TASK_ENVIRONMENT_PROTOCOL,
         "api": _redact(asdict(experiment.api)),
     }

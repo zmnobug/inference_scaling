@@ -7,6 +7,7 @@ from inference_scaling.swebench.config import BudgetConfig, ExperimentArm
 from inference_scaling.swebench.miniagent import MiniAgentSessionFactory
 from inference_scaling.swebench.runner import _run_conditional_is, _run_mh_chain
 from inference_scaling.swebench.runner import run_experiment_arm
+from inference_scaling.swebench.runner import capture_workspace_patch
 
 
 class FakeDecision:
@@ -306,6 +307,69 @@ def test_cleanup_failure_preserves_completed_result(monkeypatch) -> None:
     assert record["status"] == "error"
     assert record["submission"] == "patch"
     assert record["trajectory"] == {"messages": ["complete"]}
-    assert record["diagnostics"] == {"finished": True}
+    assert record["diagnostics"] == {"finished": True, "task_environment": []}
     assert record["error"]["type"] == "ResourceCleanupError"
     assert record["error"]["cleanup_errors"][0]["identifier"] == "checkpoint:test"
+
+
+def test_workspace_patch_is_audit_only_and_commands_are_read_only(monkeypatch):
+    commands = []
+    session = SimpleNamespace(environment=SimpleNamespace(container_id="container", executable="docker"))
+
+    def run(command, **kwargs):
+        commands.append(command)
+        assert 0 < kwargs["timeout"] <= 10
+        return SimpleNamespace(returncode=0, stdout=b"audit-data", stderr=b"")
+
+    monkeypatch.setattr("inference_scaling.swebench.runner.subprocess.run", run)
+    audit = capture_workspace_patch(session, 10)
+    assert audit["official_submission_unchanged"]
+    assert audit["tracked_patch"] == "audit-data"
+    assert audit["untracked_contents_saved"] is False
+    assert commands[0] == ["docker", "exec", "container", "git", "-C", "/testbed",
+                           "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--"]
+    assert commands[1][-3:] == ["ls-files", "--others", "--exclude-standard"]
+
+
+def test_workspace_audit_failure_is_recorded_not_raised(monkeypatch):
+    session = SimpleNamespace(environment=SimpleNamespace(container_id="container", executable="docker"))
+
+    def fail(*args, **kwargs):
+        raise TimeoutError("audit timeout")
+
+    monkeypatch.setattr("inference_scaling.swebench.runner.subprocess.run", fail)
+    audit = capture_workspace_patch(session, 10)
+    assert audit["error"]["type"] == "TimeoutError"
+    assert audit["official_submission_unchanged"]
+
+
+def test_aborted_run_captures_audit_before_cleanup_without_submitting(monkeypatch):
+    events = []
+    session = SimpleNamespace(submission="", exit_status="generation_timeout",
+                              serialize=lambda: {"messages": []})
+
+    class Factory:
+        def __init__(self, *args, **kwargs):
+            self.runtime = {"fingerprint": "runtime"}
+
+        def close_all(self):
+            events.append("cleanup")
+            return []
+
+    def capture(current, timeout):
+        assert current is session
+        events.append("audit")
+        return {"tracked_patch": "unsubmitted diff", "purpose": "audit_only"}
+
+    experiment = SimpleNamespace(budget=BudgetConfig(10, 0, 0, 10, 60), fingerprint="config",
+                                 api=SimpleNamespace(model_name="test"),
+                                 agent=SimpleNamespace(audit_patch_timeout_seconds=10))
+    monkeypatch.setattr("inference_scaling.swebench.runner.MiniAgentSessionFactory", Factory)
+    monkeypatch.setattr("inference_scaling.swebench.runner._run_base", lambda *args: (session, {}))
+    monkeypatch.setattr("inference_scaling.swebench.runner.capture_workspace_patch", capture)
+    monkeypatch.setattr("inference_scaling.swebench.runner.miniagent_manifest", lambda *args: {})
+    record = run_experiment_arm(experiment, {"instance_id": "test"}, ExperimentArm(method="base", chunk_tokens=64), 7)
+    assert events == ["audit", "cleanup"]
+    assert record["submission"] == ""
+    assert record["exit_status"] == "generation_timeout"
+    assert record["diagnostics"]["workspace_audit"]["tracked_patch"] == "unsubmitted diff"
