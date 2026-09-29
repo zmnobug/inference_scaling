@@ -20,6 +20,7 @@ if [[ -n "${SWEBENCH_ENV_FILE:-}" ]]; then
 fi
 
 cd "${repository_root}"
+export PYTHONPATH="${repository_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
 if [[ "${RUN_PREFLIGHT:-1}" == "1" ]]; then
   "${venv_path}/bin/python" -m experiments.swebench.preflight \
     --config "${config_path}"

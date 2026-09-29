@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from inference_scaling.arllm.rewards import ConsilienceReward
+from inference_scaling.arllm.rewards.intrinsic import ConsilienceReward
 from inference_scaling.swebench.baseline import SamplingStopped
 from inference_scaling.swebench.baseline import BaselineDeadline
 from inference_scaling.swebench.config import load_experiment_config
@@ -60,7 +60,7 @@ def test_invalid_rollout_keeps_fixed_denominator():
 def character_sampler():
     sampler = object.__new__(ThinkingISSampler)
     sampler._decode = lambda tokens: ''.join(chr(token.token_id) for token in tokens)
-    sampler.reward = ConsilienceReward(None)
+    sampler.reward = ConsilienceReward(None, scope="full")
     return sampler
 
 
@@ -130,7 +130,7 @@ def test_chunk_hundred_is_frozen_and_not_round_output_limit():
 
 
 def test_consilience_matches_existing_window_formula():
-    reward = ConsilienceReward(None)
+    reward = ConsilienceReward(None, scope="full")
     values = [1.0] * 10 + [3.0] * 10
     assert reward._trajectory_score(values) == pytest.approx(0.0)
     assert math.isfinite(reward._trajectory_score([2.0]))

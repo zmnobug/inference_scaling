@@ -491,14 +491,34 @@ def extract_logprob_metadata(
     choice = choices[0]
     message = _get(choice, "message")
     content = _get(message, "content") or ""
-    hidden_reasoning = _get(
-        message, "reasoning_content", _get(message, "reasoning", "")
-    )
-    if hidden_reasoning:
-        raise ValueError(
-            "API returned separately sampled reasoning without matching logprobs; "
-            "disable hidden reasoning for logprob-based IS/MH"
-        )
+    finish_reason = str(_get(choice, "finish_reason", "") or "")
+    if finish_reason not in {"stop", "length"}:
+        raise ValueError(f"unsupported API finish_reason for logprob reward: {finish_reason!r}")
+    reasoning_values = [
+        _get(message, field)
+        for field in ("reasoning_content", "reasoning")
+        if _get(message, field) not in (None, "")
+    ]
+    if any(not isinstance(value, str) for value in reasoning_values):
+        raise ValueError("API reasoning fields must contain text")
+    if len(set(reasoning_values)) > 1:
+        raise ValueError("API returned conflicting reasoning fields")
+    hidden_reasoning = reasoning_values[0] if reasoning_values else ""
+
+    def matches_content(value: str) -> bool:
+        if not hidden_reasoning and value == content:
+            return True
+        before, opening, after = value.partition("<think>")
+        if not hidden_reasoning and not opening and "</think>" not in value:
+            return False
+        remaining = after if opening else before
+        reasoning_part, closing, content_part = remaining.partition("</think>")
+        if not closing:
+            tool_index = remaining.find("<tool_call>")
+            if tool_index >= 0:
+                reasoning_part = remaining[:tool_index]
+                content_part = remaining[tool_index:]
+        return reasoning_part == hidden_reasoning and content_part == content
     logprobs = _get(choice, "logprobs")
     entries = _get(logprobs, "content") if logprobs is not None else None
     if not entries:
@@ -525,27 +545,59 @@ def extract_logprob_metadata(
         reconstructed = bytes(
             byte for value in token_bytes for byte in (value or [])
         ).decode("utf-8", errors="strict")
-    elif "".join(tokens) == content:
+    else:
         reconstructed = "".join(tokens)
     if reconstructed is None:
         raise ValueError(
             "sampled logprob tokens cannot be reconstructed from token bytes or text"
         )
-    if reconstructed != content:
+    embedded_termination_logprob: float | None = None
+    if not matches_content(reconstructed) and finish_reason == "stop" and tokens:
+        final_token = (
+            bytes(token_bytes[-1] or []).decode("utf-8", errors="strict")
+            if token_bytes[-1] is not None
+            else tokens[-1]
+        )
+        visible_reconstruction = (
+            bytes(
+                byte
+                for value in token_bytes[:-1]
+                for byte in (value or [])
+            ).decode("utf-8", errors="strict")
+            if all(value is not None for value in token_bytes[:-1])
+            else "".join(tokens[:-1])
+        )
+        if (
+            final_token in {"<|im_end|>", "<|endoftext|>"}
+            and matches_content(visible_reconstruction)
+        ):
+            embedded_termination_logprob = token_logprobs.pop()
+            tokens.pop()
+            token_bytes.pop()
+            reconstructed = visible_reconstruction
+    if not matches_content(reconstructed) and hidden_reasoning:
+        raise ValueError(
+            "API hidden reasoning and response content are not jointly covered by "
+            "matching sampled-token logprobs and supported thinking markers"
+        )
+    if not matches_content(reconstructed) and any(value is None for value in token_bytes):
+        raise ValueError(
+            "sampled logprob tokens cannot be reconstructed from token bytes or text"
+        )
+    if not matches_content(reconstructed):
         raise ValueError("sampled logprob tokens do not reconstruct response content")
 
     usage = _usage_details(response)
     input_tokens = usage.input_tokens
     output_tokens = usage.output_tokens
-    finish_reason = str(_get(choice, "finish_reason", "") or "")
-    if finish_reason not in {"stop", "length"}:
-        raise ValueError(f"unsupported API finish_reason for logprob reward: {finish_reason!r}")
     logprob_payload = logprobs if logprobs is not None else {}
     raw_termination_logprob = _get(
         choice,
         "termination_logprob",
         _get(logprob_payload, "termination_logprob"),
     )
+    if raw_termination_logprob is None:
+        raw_termination_logprob = embedded_termination_logprob
     termination_logprob: float | None = None
     if raw_termination_logprob is not None:
         termination_logprob = float(raw_termination_logprob)
@@ -591,6 +643,10 @@ def extract_logprob_metadata(
         sampled_logprob += termination_logprob
     return {
         "request_id": request_id,
+        "normalized_content": reconstructed,
+        "reasoning_normalization": (
+            "qwen3_full_stream" if reconstructed != content else "none"
+        ),
         "sampled_tokens": tokens,
         "sampled_token_bytes": token_bytes,
         "sampled_token_logprobs": token_logprobs,
@@ -655,6 +711,7 @@ class _LogprobModelMixin:
         self._request_index = 0
         self._request_lock = threading.Lock()
         self._active_request: tuple[str, int] | None = None
+        self.rejected_responses: list[dict[str, Any]] = []
         super().__init__(**kwargs)
 
     def _next_request(self, messages: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
@@ -682,7 +739,13 @@ class _LogprobModelMixin:
             metadata = extract_logprob_metadata(
                 response, request_id, logprob_mode=self._logprob_mode
             )
-        except Exception:
+        except Exception as exc:
+            if response is not None:
+                self.rejected_responses.append({
+                    "request_id": request_id,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                    "response": _redact(response.model_dump(mode="json") if hasattr(response, "model_dump") else response),
+                })
             try:
                 usage = (
                     _usage_details(response)
@@ -738,9 +801,14 @@ class _LogprobModelMixin:
             raw_response = message.get("extra", {}).get("response")
             if raw_response is None:
                 raise ValueError("MiniAgent model response was not preserved")
-            message["extra"]["inference_scaling"] = extract_logprob_metadata(
+            metadata = extract_logprob_metadata(
                 raw_response, request_id, logprob_mode=self._logprob_mode
             )
+            message["extra"]["inference_scaling"] = metadata
+            message["content"] = metadata["normalized_content"]
+            if metadata["reasoning_normalization"] != "none":
+                message.pop("reasoning_content", None)
+                message.pop("reasoning", None)
             return message
         finally:
             self._active_request = None
@@ -751,6 +819,17 @@ class _LogprobModelMixin:
 
 class LogprobLitellmTextbasedModel(_LogprobModelMixin, LitellmTextbasedModel):
     """Official MiniAgent text model with strict sampled-token logprobs."""
+
+    def _parse_actions(self, response):
+        request_id = self._active_request[0] if self._active_request else "parse"
+        metadata = extract_logprob_metadata(
+            response, request_id, logprob_mode=self._logprob_mode
+        )
+        if metadata["reasoning_normalization"] == "none":
+            return super()._parse_actions(response)
+        normalized_response = copy.deepcopy(response)
+        normalized_response.choices[0].message.content = metadata["normalized_content"]
+        return super()._parse_actions(normalized_response)
 
 
 @dataclass(frozen=True, slots=True)
