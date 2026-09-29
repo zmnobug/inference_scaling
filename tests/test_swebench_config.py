@@ -1,13 +1,124 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import asdict, replace
+import hashlib
+import json
 
 import pytest
 
 from inference_scaling.swebench.config import (
     MINI_SWE_AGENT_COMMIT,
+    ExperimentArm,
     load_experiment_config,
 )
+
+
+def test_disabled_guards_preserve_historical_fingerprints():
+    experiment = load_experiment_config("configs/qwen38_swebench_thinking_is_pilot20.toml")
+    experiment = replace(experiment, agent=replace(
+        experiment.agent, finalization_reserve_steps=0, audit_patch_timeout_seconds=0,
+    ))
+    payload = asdict(experiment)
+    payload["path"] = str(experiment.path)
+    payload["run"]["output_root"] = str(experiment.run.output_root)
+    for name in ("finalization_reserve_seconds", "finalization_reserve_steps", "audit_patch_timeout_seconds", "verification_reminder"):
+        payload["agent"].pop(name)
+    for arm in payload["arms"]:
+        for name in ("max_steps_per_round", "max_round_seconds", "max_rollout_tokens", "fallback_to_plain"):
+            arm.pop(name)
+    expected = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert experiment.fingerprint == expected
+    legacy_arm = payload["arms"][0]
+    expected_arm = hashlib.sha256(json.dumps(legacy_arm, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert experiment.arms[0].fingerprint == expected_arm
+
+
+def test_runtime_safety_defaults_are_explicit_and_fingerprinted():
+    experiment = load_experiment_config("configs/qwen38_swebench_thinking_is_envfix_failed27.toml")
+    assert experiment.agent.finalization_reserve_steps == 5
+    assert experiment.agent.audit_patch_timeout_seconds == 10
+    disabled = replace(experiment, agent=replace(
+        experiment.agent, finalization_reserve_steps=0, audit_patch_timeout_seconds=0,
+    ))
+    assert experiment.fingerprint != disabled.fingerprint
+    with pytest.raises(ValueError, match="non-negative"):
+        replace(experiment.agent, finalization_reserve_steps=-1)
+
+
+@pytest.mark.parametrize("options", [
+    {"max_steps_per_round": -1}, {"max_round_seconds": float("nan")},
+    {"max_rollout_tokens": 100}, {"method": "base", "fallback_to_plain": True},
+])
+def test_invalid_guard_config_is_rejected(options):
+    settings = dict(method="is_thinking", chunk_tokens=100, candidate_count=4, rollout_count=2)
+    settings.update(options)
+    with pytest.raises(ValueError):
+        ExperimentArm(**settings)
+
+
+def test_guarded_protocol_has_explicit_identity_and_unchanged_main_limits():
+    experiment = load_experiment_config("configs/qwen38_swebench_thinking_is_guarded_smoke.toml")
+    arm = experiment.arms[0]
+    assert (arm.max_steps_per_round, arm.max_round_seconds, arm.max_rollout_tokens) == (4, 60, 1024)
+    assert arm.fallback_to_plain
+    assert arm.tag.endswith("s4-t60-rt1024-plain")
+    assert experiment.agent.finalization_reserve_seconds == 60
+    assert experiment.agent.max_trajectory_output_tokens == 131072
+    assert experiment.agent.context_window == 133120
+    assert experiment.agent.verification_reminder
+    with pytest.raises(ValueError):
+        replace(experiment.agent, finalization_reserve_seconds=1800)
+    with pytest.raises(ValueError):
+        replace(experiment.agent, audit_patch_timeout_seconds=61)
+
+
+def test_zero_case_and_ledger_time_limits_are_explicitly_unlimited():
+    experiment = load_experiment_config("configs/qwen38_swebench_thinking_is_pilot20.toml")
+    unlimited = replace(experiment.agent, wall_time_limit_seconds=0)
+    assert unlimited.wall_time_limit_seconds == 0
+    assert replace(experiment.budget, max_wall_seconds=0).max_wall_seconds == 0
+    with pytest.raises(ValueError):
+        replace(experiment.agent, wall_time_limit_seconds=-1)
+    with pytest.raises(ValueError):
+        replace(experiment.budget, max_wall_seconds=-1)
+    with pytest.raises(ValueError):
+        replace(unlimited, finalization_reserve_seconds=60)
+
+
+def test_failed30_config_disables_only_case_time_budgets():
+    experiment = load_experiment_config("configs/qwen38_swebench_thinking_is_failed30_unlimited.toml")
+    original = load_experiment_config("configs/qwen38_swebench_thinking_is_pilot20.toml")
+    assert experiment.agent == replace(original.agent, wall_time_limit_seconds=0)
+    assert experiment.budget == replace(original.budget, max_wall_seconds=0)
+    assert experiment.api == original.api
+    assert experiment.arms == original.arms
+    assert experiment.fingerprint != original.fingerprint
+    instances = Path("configs/qwen38_swebench_baseline_failed30_instances.txt").read_text().splitlines()
+    assert len(instances) == len(set(instances)) == 30
+    import re
+    assert all(re.fullmatch(experiment.run.instance_filter, instance) for instance in instances)
+    assert not re.fullmatch(experiment.run.instance_filter, "astropy__astropy-8872")
+
+
+def test_baseline_rerun2_matches_unlimited_is_protocol_except_sampling():
+    import re
+
+    baseline = load_experiment_config("configs/qwen38_swebench_baseline_unlimited_rerun2.toml")
+    thinking_is = load_experiment_config("configs/qwen38_swebench_thinking_is_failed30_unlimited.toml")
+    assert baseline.agent == thinking_is.agent
+    assert baseline.api == thinking_is.api
+    assert baseline.budget == thinking_is.budget
+    assert replace(baseline.run, tag=thinking_is.run.tag, instance_filter=thinking_is.run.instance_filter) == thinking_is.run
+    assert len(baseline.arms) == 1
+    assert baseline.arms[0].method == "base"
+    assert baseline.arms[0].chunk_tokens == baseline.agent.max_trajectory_output_tokens
+    assert baseline.arms[0].candidate_count is None
+    assert baseline.arms[0].rollout_count is None
+    instances = Path("configs/qwen38_swebench_baseline_failed30_instances.txt").read_text().splitlines()
+    assert {name for name in instances if re.fullmatch(baseline.run.instance_filter, name)} == {
+        "django__django-15098", "scikit-learn__scikit-learn-14894",
+    }
 
 
 CONFIG = f"""

@@ -1,0 +1,48 @@
+[run]
+tag = "qwen38-thinking-is-c100-envfix-failed27-20260923"
+output_root = "results/swebench"
+subset = "verified"
+split = "test"
+dataset_revision = "78f471bf655a3137b2e8a75af1501690ec009ec3"
+workers = 1
+seeds = [20260916]
+miniagent_commit = "25941c89cfbc91eb40b3f8756348c91d9977d57e"
+miniagent_config = "swebench_xml.yaml"
+environment_class = "docker"
+instance_filter = "^(astropy__astropy-13236|astropy__astropy-14365|django__django-10554|django__django-11477|django__django-11532|django__django-11848|django__django-13195|django__django-13212|django__django-13406|django__django-14315|django__django-14404|django__django-14534|django__django-14771|django__django-15695|django__django-15973|matplotlib__matplotlib-23476|matplotlib__matplotlib-26466|psf__requests-2931|pydata__xarray-6938|pytest-dev__pytest-10356|sphinx-doc__sphinx-8548|sphinx-doc__sphinx-9711|sympy__sympy-15976|sympy__sympy-16597|sympy__sympy-17139|sympy__sympy-18211|sympy__sympy-18763)$"
+instance_slice = ""
+
+[api]
+model_name = "openai/qwen3.8-27b"
+deployment_id = "qwen3.8-27b-v100-ctx133120-thinking-is-c100-20260918"
+base_url_env = "OPENAI_API_BASE"
+api_key_env = "OPENAI_API_KEY"
+temperature = 1.0
+top_p = 1.0
+timeout_seconds = 1800
+max_retries = 0
+seed_supported = true
+logprob_mode = "visible_tokens"
+
+[agent]
+action_mode = "text"
+step_limit = 250
+cost_limit = 0
+wall_time_limit_seconds = 0
+max_trajectory_output_tokens = 131072
+context_window = 133120
+context_safety_tokens = 256
+max_consecutive_format_errors = 3
+
+[budget]
+max_api_requests = 50000
+max_input_tokens = 0
+max_output_tokens = 0
+max_tool_calls = 250
+max_wall_seconds = 0
+
+[[arms]]
+method = "is_thinking"
+chunk_tokens = 100
+candidate_count = 4
+rollout_count = 2
