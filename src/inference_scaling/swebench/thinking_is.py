@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from minisweagent.exceptions import FormatError
 from minisweagent.models.utils.actions_text import parse_regex_actions
 
-from inference_scaling.arllm.rewards import ConsilienceReward
+from inference_scaling.arllm.rewards.intrinsic import ConsilienceReward
 from inference_scaling.swebench.baseline import BaselineDeadline, SamplingStopped
 from inference_scaling.swebench.miniagent import SampledDecision
 from inference_scaling.swebench.sampling import categorical_index, effective_sample_size
@@ -91,7 +91,7 @@ class ThinkingISSampler:
         self.runtime = factory.runtime
         self.model = factory.experiment.api.model_name.removeprefix("openai/")
         self.reward = ConsilienceReward(None, top_k=5, skip_fraction=0.05,
-                                        window_fraction=0.2, initial_penalty=3.0, scale=1.0)
+                                        window_fraction=0.2, initial_penalty=3.0, scope="full")
         self.rng = random.Random(self._seed("selection"))
         self.diagnostics = {"protocol": "thinking-is-token-prefix-v3", "chunk_tokens": arm.chunk_tokens,
                             "candidate_count": arm.candidate_count, "rollout_count": arm.rollout_count,

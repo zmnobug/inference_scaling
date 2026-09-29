@@ -3,10 +3,10 @@ from __future__ import annotations
 import sys
 import json
 from dataclasses import replace
-
-import pytest
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from inference_scaling.swebench.config import (
     ExperimentArm,
@@ -17,6 +17,35 @@ from inference_scaling.swebench.runner import RESULT_SCHEMA_VERSION
 
 from experiments.swebench import run_suite
 from experiments.swebench.run_suite import _select_incomplete_instance_batch
+
+
+def test_low_disk_waits_without_starting_work(monkeypatch, tmp_path):
+    free_values = iter([3 * 1024 ** 3, 5 * 1024 ** 3])
+    sleeps = []
+    monkeypatch.setattr(run_suite.shutil, "disk_usage", lambda path: SimpleNamespace(free=next(free_values)))
+    monkeypatch.setattr(run_suite.time, "sleep", sleeps.append)
+    run_suite._wait_for_disk_space(tmp_path, 4)
+    assert sleeps == [300]
+
+
+@pytest.mark.parametrize("minimum", [-1, float("nan"), float("inf")])
+def test_invalid_disk_threshold_is_rejected(tmp_path, minimum):
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        run_suite._wait_for_disk_space(tmp_path, minimum)
+
+
+def test_low_docker_disk_waits_even_with_free_result_disk(monkeypatch, tmp_path, capsys):
+    docker_path = tmp_path / "docker"
+    docker_free = iter([3 * 1024 ** 3, 5 * 1024 ** 3])
+    sleeps = []
+    monkeypatch.setattr(
+        run_suite.shutil, "disk_usage",
+        lambda path: SimpleNamespace(free=next(docker_free) if path == docker_path else 100 * 1024 ** 3),
+    )
+    monkeypatch.setattr(run_suite.time, "sleep", sleeps.append)
+    run_suite._wait_for_disk_space(tmp_path, 4, (docker_path,))
+    assert sleeps == [300]
+    assert str(docker_path) in capsys.readouterr().out
 
 
 def test_instance_batch_advances_past_completed_instances() -> None:

@@ -11,5 +11,6 @@ if [[ ! -x "${venv_path}/bin/python" ]]; then
 fi
 
 cd "${repository_root}"
+export PYTHONPATH="${repository_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
 exec "${venv_path}/bin/python" -m experiments.swebench.evaluate \
   --results "${results_path}" "$@"

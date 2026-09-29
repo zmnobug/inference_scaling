@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import math
 import re
+import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -30,6 +33,31 @@ from inference_scaling.swebench.config import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _wait_for_disk_space(
+    path: Path, minimum_gib: float, additional_paths: tuple[Path, ...] = ()
+) -> None:
+    if not math.isfinite(minimum_gib) or minimum_gib < 0:
+        raise ValueError("minimum free disk space must be finite and non-negative")
+    if minimum_gib == 0:
+        return
+    while True:
+        low_paths = [
+            (guard_path, free_gib)
+            for guard_path in (path, *additional_paths)
+            if (free_gib := shutil.disk_usage(guard_path).free / (1024 ** 3)) < minimum_gib
+        ]
+        if not low_paths:
+            return
+        for guard_path, free_gib in low_paths:
+            print(
+                json.dumps({"status": "paused_low_disk", "path": str(guard_path),
+                            "free_gib": free_gib, "minimum_gib": minimum_gib,
+                            "retry_seconds": 300}),
+                flush=True,
+            )
+        time.sleep(300)
 
 
 def _slice_instances(
@@ -147,6 +175,8 @@ def main() -> None:
     parser.add_argument("--instance-file", type=Path)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--workers", type=int)
+    parser.add_argument("--min-free-gib", type=float, default=0)
+    parser.add_argument("--disk-guard-path", type=Path, action="append", default=[])
     parser.add_argument(
         "--batch-instances",
         type=int,
@@ -163,6 +193,8 @@ def main() -> None:
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if not math.isfinite(args.min_free_gib) or args.min_free_gib < 0:
+        parser.error("--min-free-gib must be finite and non-negative")
     if args.batch_instances is not None and args.batch_instances <= 0:
         parser.error("--batch-instances must be positive")
 
@@ -319,6 +351,9 @@ def main() -> None:
                 "instance": instance_id,
                 "seed": seed,
             }
+        _wait_for_disk_space(output_root, args.min_free_gib, tuple(args.disk_guard_path))
+        print(json.dumps({"status": "starting", "instance": instance_id,
+                          "arm": arm.tag, "seed": seed}), flush=True)
         record = run_experiment_arm(experiment, instance, arm, seed)
         _write_result(directory, record)
         return {

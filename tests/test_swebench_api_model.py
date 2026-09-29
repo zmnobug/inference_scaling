@@ -12,6 +12,7 @@ from inference_scaling.swebench.miniagent import (
     BudgetedEnvironment,
     BudgetLedger,
     _LogprobModelMixin,
+    LogprobLitellmTextbasedModel,
     MiniAgentSession,
     MiniAgentSessionFactory,
     SessionCheckpoint,
@@ -176,11 +177,236 @@ def test_logprob_tokens_must_reconstruct_content() -> None:
         extract_logprob_metadata(response, "request")
 
 
+def test_qwen_embedded_im_end_is_recorded_as_termination_logprob() -> None:
+    response = _response("ok")
+    response["choices"][0]["logprobs"]["content"].append(
+        {
+            "token": "<|im_end|>",
+            "bytes": list(b"<|im_end|>"),
+            "logprob": -0.5,
+        }
+    )
+    response["usage"]["completion_tokens"] = 2
+
+    metadata = extract_logprob_metadata(response, "request")
+
+    assert metadata["sampled_tokens"] == ["ok"]
+    assert metadata["termination_logprob"] == -0.5
+    assert metadata["termination_status"] == "scored"
+    assert metadata["scored_output_tokens"] == 2
+
+
+def test_unrecognized_logprob_suffix_is_not_treated_as_termination() -> None:
+    response = _response("ok")
+    response["choices"][0]["logprobs"]["content"].append(
+        {"token": "extra", "bytes": list(b"extra"), "logprob": -0.5}
+    )
+    response["usage"]["completion_tokens"] = 2
+    with pytest.raises(ValueError, match="do not reconstruct"):
+        extract_logprob_metadata(response, "request")
+
+
 def test_hidden_reasoning_is_rejected() -> None:
     with pytest.raises(ValueError, match="hidden reasoning"):
         extract_logprob_metadata(
             _response(reasoning_content="unscored thought"), "request"
         )
+
+
+def _reasoning_response(
+    *, opening: bool = False, finish_reason: str = "stop", content: str | None = "ok"
+) -> dict[str, Any]:
+    response = _response(content or "", reasoning_content="THOUGHT: 检查代码\n")
+    response["choices"][0]["message"]["content"] = content
+    tokens = (["<think>"] if opening else []) + ["THOUGHT: 检查代码\n"]
+    if content is not None:
+        tokens.extend(["</think>", content])
+    if finish_reason == "stop":
+        tokens.append("<|im_end|>")
+    response["choices"][0]["finish_reason"] = finish_reason
+    response["choices"][0]["logprobs"]["content"] = [
+        {"token": token, "bytes": list(token.encode()), "logprob": -0.25}
+        for token in tokens
+    ]
+    response["usage"]["completion_tokens"] = len(tokens)
+    return response
+
+
+@pytest.mark.parametrize("opening", [False, True])
+@pytest.mark.parametrize("reasoning_field", ["reasoning_content", "reasoning"])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_scored_reasoning_is_restored_losslessly(opening, reasoning_field, finish_reason):
+    response = _reasoning_response(opening=opening, finish_reason=finish_reason)
+    message = response["choices"][0]["message"]
+    original_reasoning = message.pop("reasoning_content")
+    message["reasoning_content"] = None
+    message[reasoning_field] = original_reasoning
+
+    metadata = extract_logprob_metadata(response, "request", logprob_mode="power_target_exact")
+
+    expected = ("<think>" if opening else "") + original_reasoning + "</think>ok"
+    assert metadata["normalized_content"] == expected
+    assert "".join(metadata["sampled_tokens"]) == expected
+    assert metadata["reasoning_normalization"] == "qwen3_full_stream"
+    assert metadata["unscored_output_tokens"] == 0
+    assert metadata["scored_output_tokens"] == response["usage"]["completion_tokens"]
+    assert metadata["sampled_logprob"] == -0.25 * metadata["scored_output_tokens"]
+    assert message["content"] == "ok"
+    assert message[reasoning_field] == original_reasoning
+
+
+def test_reasoning_aliases_must_agree():
+    response = _reasoning_response()
+    response["choices"][0]["message"]["reasoning"] = "different reasoning"
+    with pytest.raises(ValueError, match="conflicting reasoning"):
+        extract_logprob_metadata(response, "request")
+
+
+def test_reasoning_normalization_does_not_ignore_unscored_tokens():
+    response = _reasoning_response()
+    response["usage"]["completion_tokens"] += 1
+    with pytest.raises(ValueError, match="without matching logprobs"):
+        extract_logprob_metadata(response, "request")
+
+
+def test_reasoning_normalization_rejects_unknown_markers():
+    response = _reasoning_response()
+    response["choices"][0]["logprobs"]["content"][1].update(
+        token="<unknown>", bytes=list(b"<unknown>")
+    )
+    with pytest.raises(ValueError, match="hidden reasoning"):
+        extract_logprob_metadata(response, "request")
+
+
+def test_length_truncated_reasoning_is_scored_without_fabricating_closing_marker():
+    response = _reasoning_response(finish_reason="length", content=None)
+    metadata = extract_logprob_metadata(response, "request")
+    assert metadata["normalized_content"] == "THOUGHT: 检查代码\n"
+    assert metadata["termination_status"] == "deterministic_length"
+    assert metadata["unscored_output_tokens"] == 0
+
+
+def test_reasoning_bytes_can_cross_utf8_boundaries():
+    response = _reasoning_response()
+    entries = response["choices"][0]["logprobs"]["content"]
+    encoded = "THOUGHT: 检查代码\n".encode()
+    entries[:1] = [
+        {"token": "partial", "bytes": list(encoded[:10]), "logprob": -0.25},
+        {"token": "partial", "bytes": list(encoded[10:]), "logprob": -0.25},
+    ]
+    response["usage"]["completion_tokens"] += 1
+    metadata = extract_logprob_metadata(response, "request")
+    assert metadata["normalized_content"] == "THOUGHT: 检查代码\n</think>ok"
+
+
+def test_scored_prefix_discarded_by_qwen_parser_is_preserved():
+    response = _reasoning_response(opening=True)
+    response["choices"][0]["logprobs"]["content"].insert(
+        0, {"token": "THO", "bytes": list(b"THO"), "logprob": -0.5}
+    )
+    response["usage"]["completion_tokens"] += 1
+    metadata = extract_logprob_metadata(response, "request")
+    assert metadata["normalized_content"] == "THO<think>THOUGHT: 检查代码\n</think>ok"
+    assert metadata["sampled_token_logprobs"][0] == -0.5
+    assert metadata["unscored_output_tokens"] == 0
+
+
+def test_empty_reasoning_with_scored_markers_is_preserved():
+    response = _reasoning_response(opening=True)
+    response["choices"][0]["message"]["reasoning_content"] = ""
+    del response["choices"][0]["logprobs"]["content"][1]
+    response["usage"]["completion_tokens"] -= 1
+    metadata = extract_logprob_metadata(response, "request")
+    assert metadata["normalized_content"] == "<think></think>ok"
+    assert metadata["reasoning_normalization"] == "qwen3_full_stream"
+
+
+def _reasoning_model(monkeypatch, response):
+    import litellm
+
+    for entry in response["choices"][0]["logprobs"]["content"]:
+        entry["top_logprobs"] = []
+    monkeypatch.setenv("MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT", "1")
+    model_response = litellm.ModelResponse(**response)
+    monkeypatch.setattr(litellm, "completion", lambda **kwargs: model_response)
+    return LogprobLitellmTextbasedModel(
+        ledger=_ledger(),
+        base_seed=7,
+        request_namespace="reasoning-test",
+        seed_supported=True,
+        model_name="openai/test",
+        cost_tracking="ignore_errors",
+        action_regex=r"<mswea_bash_command>(.*?)</mswea_bash_command>",
+    )
+
+
+def test_model_preserves_raw_reasoning_and_uses_scored_content_for_history(monkeypatch):
+    content = "<mswea_bash_command>echo ok</mswea_bash_command>"
+    model = _reasoning_model(monkeypatch, _reasoning_response(content=content))
+    message = model.query([{"role": "user", "content": "task"}])
+
+    assert message["content"] == "THOUGHT: 检查代码\n</think>" + content
+    assert not message.get("reasoning_content")
+    assert not message.get("reasoning")
+    assert message["extra"]["actions"] == [{"command": "echo ok"}]
+    raw_message = message["extra"]["response"]["choices"][0]["message"]
+    assert raw_message["content"] == content
+    assert raw_message["reasoning_content"] == "THOUGHT: 检查代码\n"
+    assert model._ledger.snapshot().output_tokens == 4
+
+
+def test_rejected_response_is_preserved_without_weakening_validation(monkeypatch):
+    raw = _response()
+    raw["choices"][0]["message"]["content"] = "different"
+    model = _reasoning_model(monkeypatch, raw)
+    with pytest.raises(ValueError, match="reconstruct"):
+        model._query([{"role": "user", "content": "task"}])
+    assert len(model.rejected_responses) == 1
+    saved = model.rejected_responses[0]
+    assert saved["response"]["choices"][0]["message"]["content"] == "different"
+    assert saved["response"]["choices"][0]["logprobs"]["content"][0]["token"] == "ok"
+    assert model._ledger.snapshot().api_failures == 1
+    assert model._ledger.snapshot().output_tokens == 1
+
+
+def test_real_session_format_errors_count_budget_and_reset_after_action():
+    from dataclasses import replace
+    from inference_scaling.swebench.miniagent import decision_from_message
+
+    model = _SessionModel()
+    session = _bare_session(model, chunk_tokens=64, max_tokens=100)
+    session.agent.n_consecutive_format_errors = 0
+    session.agent.config.max_consecutive_format_errors = 3
+    session.agent.execute_actions = lambda message: None
+    action = decision_from_message(model.query([]))
+    malformed = replace(action, kind="format_error", messages=({"role": "user", "content": "format error"},))
+    session.apply_decision(malformed)
+    session.apply_decision(malformed)
+    assert not session.terminal
+    assert session.agent.n_consecutive_format_errors == 2
+    session.apply_decision(action)
+    assert session.agent.n_consecutive_format_errors == 0
+    for _ in range(3):
+        session.apply_decision(malformed)
+    assert session.exit_status == "RepeatedFormatError"
+    assert session.agent.n_calls == 6
+    assert session.trajectory_output_tokens == 6
+
+
+def test_parser_checks_actions_in_the_complete_scored_stream(monkeypatch):
+    from minisweagent.exceptions import FormatError
+
+    response = _reasoning_response(content="<mswea_bash_command>echo ok</mswea_bash_command>")
+    reasoning = "<mswea_bash_command>echo extra</mswea_bash_command>"
+    response["choices"][0]["message"]["reasoning_content"] = reasoning
+    response["choices"][0]["logprobs"]["content"][0].update(
+        token=reasoning, bytes=list(reasoning.encode())
+    )
+    model = _reasoning_model(monkeypatch, response)
+    with pytest.raises(FormatError) as failure:
+        model.query([{"role": "user", "content": "task"}])
+    assert failure.value.messages[0]["extra"]["n_actions"] == 2
+    assert failure.value.messages[0]["extra"]["inference_scaling"]["unscored_output_tokens"] == 0
 
 
 def test_unscored_output_tokens_are_rejected() -> None:
@@ -277,6 +503,26 @@ def test_zero_token_limits_record_without_truncating() -> None:
     usage = ledger.snapshot()
     assert usage.input_tokens == 10**9
     assert usage.output_tokens == 10**8
+
+
+def test_zero_wall_budget_keeps_elapsed_time_and_request_limit(monkeypatch) -> None:
+    ledger = BudgetLedger(BudgetConfig(1, 0, 0, 10, 0))
+    monkeypatch.setattr(ledger, "_elapsed", lambda: 100_000.0)
+    ledger.start_api_request()
+    ledger.finish_api_request(100, 10, 2.5, failed=False)
+    assert ledger.snapshot().elapsed_seconds == 100_000.0
+    assert ledger.snapshot().api_seconds == 2.5
+    from inference_scaling.swebench.miniagent import ExperimentBudgetExceeded
+    with pytest.raises(ExperimentBudgetExceeded, match="request budget"):
+        ledger.start_api_request()
+
+
+def test_positive_wall_budget_still_expires(monkeypatch) -> None:
+    ledger = _ledger()
+    monkeypatch.setattr(ledger, "_elapsed", lambda: 61.0)
+    from inference_scaling.swebench.miniagent import ExperimentBudgetExceeded
+    with pytest.raises(ExperimentBudgetExceeded, match="wall budget"):
+        ledger.check()
 
 
 def test_docker_environment_checkpoint_is_audited(
@@ -449,7 +695,8 @@ def test_discard_checkpoint_removes_its_tag_not_the_bare_image_id(
     assert factory._snapshot_images == []
 
 
-def test_factory_applies_configured_retry_count(monkeypatch) -> None:
+@pytest.mark.parametrize("wall_limit", [60, 0])
+def test_factory_applies_configured_retry_count(monkeypatch, wall_limit) -> None:
     monkeypatch.setenv("MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT", "99")
     monkeypatch.setattr(
         "inference_scaling.swebench.miniagent.get_config_from_spec",
@@ -471,15 +718,20 @@ def test_factory_applies_configured_retry_count(monkeypatch) -> None:
         agent=SimpleNamespace(
             step_limit=20,
             cost_limit=0,
-            wall_time_limit_seconds=60,
+            wall_time_limit_seconds=wall_limit,
         ),
     )
 
-    MiniAgentSessionFactory(
+    factory = MiniAgentSessionFactory(
         cast(Any, experiment), {"instance_id": "instance"}, _ledger(), environ={}
     )
 
     assert os.environ["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] == "3"
+    assert factory.mini_config["agent"]["wall_time_limit_seconds"] == wall_limit
+    assert "automatically activates" in factory.mini_config["agent"]["system_template"]
+    assert factory.mini_config["environment"].get("container_timeout", "2h") == (
+        "2h" if wall_limit else "infinity"
+    )
 
 
 def test_close_all_reports_cleanup_failures_and_continues(monkeypatch) -> None:
