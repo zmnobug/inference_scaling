@@ -24,6 +24,8 @@ from inference_scaling.swebench.task_environment import (
     verify_task_environment,
 )
 
+EOS_TEXTS = ("<|im_end|>", "<|endoftext|>", "<｜end▁of▁sentence｜>")
+
 try:
     from minisweagent import __version__ as miniagent_version
     from minisweagent.agents.default import DefaultAgent
@@ -508,6 +510,10 @@ def extract_logprob_metadata(
     def matches_content(value: str) -> bool:
         if not hidden_reasoning and value == content:
             return True
+        if not hidden_reasoning and "<think>" not in value and value.count("</think>") == 1:
+            before, _, after = value.partition("</think>")
+            if before + after == content:
+                return True
         before, opening, after = value.partition("<think>")
         if not hidden_reasoning and not opening and "</think>" not in value:
             return False
@@ -568,7 +574,7 @@ def extract_logprob_metadata(
             else "".join(tokens[:-1])
         )
         if (
-            final_token in {"<|im_end|>", "<|endoftext|>"}
+            final_token in EOS_TEXTS
             and matches_content(visible_reconstruction)
         ):
             embedded_termination_logprob = token_logprobs.pop()
@@ -645,7 +651,12 @@ def extract_logprob_metadata(
         "request_id": request_id,
         "normalized_content": reconstructed,
         "reasoning_normalization": (
-            "qwen3_full_stream" if reconstructed != content else "none"
+            (
+                "qwen3_full_stream"
+                if hidden_reasoning or "<think>" in reconstructed
+                else "deepseek_closing_marker"
+            )
+            if reconstructed != content else "none"
         ),
         "sampled_tokens": tokens,
         "sampled_token_bytes": token_bytes,

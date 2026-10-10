@@ -16,12 +16,11 @@ from minisweagent.models.utils.actions_text import parse_regex_actions
 
 from inference_scaling.arllm.rewards.intrinsic import ConsilienceReward
 from inference_scaling.swebench.baseline import BaselineDeadline, SamplingStopped
-from inference_scaling.swebench.miniagent import SampledDecision
+from inference_scaling.swebench.miniagent import EOS_TEXTS, SampledDecision
 from inference_scaling.swebench.sampling import categorical_index, effective_sample_size
 
 
 OPEN_ACTION = "<mswea_bash_command>"
-EOS_TEXTS = ("<|im_end|>", "<|endoftext|>")
 
 
 class InvalidSample(ValueError):

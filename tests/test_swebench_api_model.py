@@ -196,6 +196,60 @@ def test_qwen_embedded_im_end_is_recorded_as_termination_logprob() -> None:
     assert metadata["scored_output_tokens"] == 2
 
 
+def _deepseek_response() -> dict[str, Any]:
+    content = "THOUGHT: inspect code\n<mswea_bash_command>echo ready</mswea_bash_command>"
+    response = _response(content)
+    visible, action = content.split("<mswea_bash_command>", 1)
+    parts = [
+        visible,
+        "</think>",
+        "<mswea_bash_command>" + action,
+        "<｜end▁of▁sentence｜>",
+    ]
+    response["choices"][0]["logprobs"]["content"] = [
+        {"token": part, "bytes": list(part.encode("utf-8")), "logprob": -0.25}
+        for part in parts
+    ]
+    response["usage"]["completion_tokens"] = len(parts)
+    return response
+
+
+@pytest.mark.parametrize("mode", ["visible_tokens", "power_target_exact"])
+def test_deepseek_scored_closing_marker_and_eos_are_preserved(mode):
+    response = _deepseek_response()
+    metadata = extract_logprob_metadata(response, "request", logprob_mode=mode)
+
+    assert metadata["normalized_content"] == response["choices"][0]["message"]["content"].replace(
+        "<mswea_bash_command>", "</think><mswea_bash_command>"
+    )
+    assert metadata["reasoning_normalization"] == "deepseek_closing_marker"
+    assert metadata["sampled_tokens"][1] == "</think>"
+    assert metadata["sampled_token_logprobs"] == [-0.25] * 3
+    assert metadata["termination_logprob"] == -0.25
+    assert metadata["scored_output_tokens"] == 4
+    assert metadata["unscored_output_tokens"] == 0
+    assert metadata["sampled_logprob"] == (-1.0 if mode == "power_target_exact" else -0.75)
+
+
+@pytest.mark.parametrize("fault", ["content", "closing", "eos", "usage", "finish"])
+def test_deepseek_only_accepts_exact_scored_reconstruction(fault):
+    response = _deepseek_response()
+    choice = response["choices"][0]
+    entries = choice["logprobs"]["content"]
+    if fault == "content":
+        choice["message"]["content"] += "extra"
+    elif fault == "closing":
+        entries[1]["bytes"] = list(b"</think></think>")
+    elif fault == "eos":
+        entries[-1]["bytes"] = list(b"<unrecognized-eos>")
+    elif fault == "usage":
+        response["usage"]["completion_tokens"] += 1
+    else:
+        choice["finish_reason"] = "length"
+    with pytest.raises(ValueError, match="reconstruct|without matching logprobs"):
+        extract_logprob_metadata(response, "request")
+
+
 def test_unrecognized_logprob_suffix_is_not_treated_as_termination() -> None:
     response = _response("ok")
     response["choices"][0]["logprobs"]["content"].append(
@@ -352,6 +406,19 @@ def test_model_preserves_raw_reasoning_and_uses_scored_content_for_history(monke
     raw_message = message["extra"]["response"]["choices"][0]["message"]
     assert raw_message["content"] == content
     assert raw_message["reasoning_content"] == "THOUGHT: 检查代码\n"
+    assert model._ledger.snapshot().output_tokens == 4
+
+
+def test_deepseek_model_parses_action_from_scored_stream(monkeypatch):
+    response = _deepseek_response()
+    model = _reasoning_model(monkeypatch, response)
+    message = model.query([{"role": "user", "content": "task"}])
+
+    assert "</think><mswea_bash_command>" in message["content"]
+    assert message["extra"]["actions"] == [{"command": "echo ready"}]
+    assert message["extra"]["response"]["choices"][0]["message"]["content"] == (
+        response["choices"][0]["message"]["content"]
+    )
     assert model._ledger.snapshot().output_tokens == 4
 
 
