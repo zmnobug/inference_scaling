@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from minisweagent.exceptions import FormatError
 from minisweagent.models.utils.actions_text import parse_regex_actions
 
+from inference_scaling.arllm.config import SamplingConfig
 from inference_scaling.arllm.rewards.intrinsic import ConsilienceReward
+from inference_scaling.arllm.types import TokenStatistic
 from inference_scaling.swebench.baseline import BaselineDeadline, SamplingStopped
 from inference_scaling.swebench.miniagent import EOS_TEXTS, SampledDecision
 from inference_scaling.swebench.sampling import categorical_index, effective_sample_size
@@ -89,7 +91,7 @@ class ThinkingISSampler:
         self.deadline = 0.0
         self.runtime = factory.runtime
         self.model = factory.experiment.api.model_name.removeprefix("openai/")
-        self.reward = ConsilienceReward(None, top_k=5, skip_fraction=0.05,
+        self.reward = ConsilienceReward(None, TokenStatistic(SamplingConfig(), 5), skip_fraction=0.05,
                                         window_fraction=0.2, initial_penalty=3.0, scope="full")
         self.rng = random.Random(self._seed("selection"))
         self.diagnostics = {"protocol": "thinking-is-token-prefix-v3", "chunk_tokens": arm.chunk_tokens,
@@ -203,7 +205,7 @@ class ThinkingISSampler:
         boundary = self._boundary(tokens)
         if boundary is None or boundary[0] == 0:
             return None
-        score = self.reward._trajectory_score([token.confidence for token in tokens[:boundary[0]]])
+        score = self.reward.reduce([token.confidence for token in tokens[:boundary[0]]])
         return score if math.isfinite(score) else None
 
     def preflight(self):

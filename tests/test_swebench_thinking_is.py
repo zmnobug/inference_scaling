@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from inference_scaling.arllm.config import SamplingConfig
 from inference_scaling.arllm.rewards.intrinsic import ConsilienceReward
+from inference_scaling.arllm.types import TokenStatistic
 from inference_scaling.swebench.baseline import SamplingStopped
 from inference_scaling.swebench.baseline import BaselineDeadline
 from inference_scaling.swebench.config import load_experiment_config
@@ -60,7 +62,7 @@ def test_invalid_rollout_keeps_fixed_denominator():
 def character_sampler():
     sampler = object.__new__(ThinkingISSampler)
     sampler._decode = lambda tokens: ''.join(chr(token.token_id) for token in tokens)
-    sampler.reward = ConsilienceReward(None, scope="full")
+    sampler.reward = ConsilienceReward(None, TokenStatistic(SamplingConfig(), 5), scope="full")
     return sampler
 
 
@@ -95,7 +97,7 @@ def test_shared_boundary_tokens_are_preserved_without_scoring_body():
     vocabulary[4] = ">/"
     assert sampler._boundary(sample) == (1, 4)
     assert sampler._decode(sample[:4]).endswith(OPEN_ACTION + "/")
-    assert sampler._quality(sample) == sampler.reward._trajectory_score([2])
+    assert sampler._quality(sample) == sampler.reward.reduce([2])
 
 
 def test_sample_rejection_keeps_raw_response_and_accounts_usage():
@@ -130,10 +132,10 @@ def test_chunk_hundred_is_frozen_and_not_round_output_limit():
 
 
 def test_consilience_matches_existing_window_formula():
-    reward = ConsilienceReward(None, scope="full")
+    reward = ConsilienceReward(None, TokenStatistic(SamplingConfig(), 5), scope="full")
     values = [1.0] * 10 + [3.0] * 10
-    assert reward._trajectory_score(values) == pytest.approx(0.0)
-    assert math.isfinite(reward._trajectory_score([2.0]))
+    assert reward.reduce(values) == pytest.approx(0.0)
+    assert math.isfinite(reward.reduce([2.0]))
 
 
 def test_multistep_selection_discards_rollouts_and_samples_action_once():
@@ -290,7 +292,7 @@ def test_zero_thinking_policy_does_not_rescue_truly_invalid_candidates(fault):
     if fault == "shared_thinking_token":
         sampler._decode = lambda values: "THOUGHT" + OPEN_ACTION if values else ""
     if fault == "nonfinite_reward":
-        sampler.reward = SimpleNamespace(_trajectory_score=lambda values: float("nan"))
+        sampler.reward = SimpleNamespace(reduce=lambda values: float("nan"))
 
     def sample(prompt, maximum, role):
         audit_fake_sample(sampler)
